@@ -338,28 +338,52 @@ class SamDBHelper(SamDB):
         return render_template('Pull.xml', **context)
 
     def render_topology_action(self, **context):
-            """Responds to Topology Management requests (e.g., GetADDomainController)"""
-            res = self.search(base="", scope=ldb.SCOPE_BASE, attrs=["dnsHostName", "netbiosName"])
-            dns_name = str(res[0].get("dnsHostName", "samba.vlab.test"))
-            # Fallback if netbios name isn't in rootDSE
-            netbios_name = str(res[0].get("netbiosName", dns_name.split('.')[0].upper()))
+        """Responds to various Topology Management requests."""
+        action = context.get('Action', '')
+        message_id = context.get('MessageID')
+        
+        # Fetch basic domain info from RootDSE
+        res = self.search(base="", scope=ldb.SCOPE_BASE, attrs=["dnsHostName", "defaultNamingContext"])
+        dns_hostname = str(res[0].get("dnsHostName", "samba.vlab.test"))
+        distinguished_name = str(res[0].get("defaultNamingContext", "DC=vlab,DC=test"))
+        netbios_name = dns_hostname.split('.')[0].upper()
 
-            return f"""<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing">
-        <s:Header>
-            <a:Action s:mustUnderstand="1">http://schemas.microsoft.com/2008/1/ActiveDirectory/Topology/GetADDomainControllerResponse</a:Action>
-            <a:RelatesTo>{context.get('MessageID')}</a:RelatesTo>
-        </s:Header>
-        <s:Body>
-            <GetADDomainControllerResponse xmlns="http://schemas.microsoft.com/2008/1/ActiveDirectory/Topology">
-                <GetADDomainControllerResult>
-                    <DestinationServer>{dns_name}</DestinationServer>
-                    <HostName>{dns_name}</HostName>
-                    <NetbiosName>{netbios_name}</NetbiosName>
-                    <Site>Default-First-Site-Name</Site>
-                </GetADDomainControllerResult>
-            </GetADDomainControllerResponse>
-        </s:Body>
-    </s:Envelope>"""
+        # CASE 1: Client wants Domain Controller Info
+        if 'GetADDomainController' in action:
+            response_action = "http://schemas.microsoft.com/2008/1/ActiveDirectory/Topology/GetADDomainControllerResponse"
+            body_content = f"""
+                <GetADDomainControllerResponse xmlns="http://schemas.microsoft.com/2008/1/ActiveDirectory/Topology">
+                    <GetADDomainControllerResult>
+                        <DestinationServer>{dns_hostname}</DestinationServer>
+                        <HostName>{dns_hostname}</HostName>
+                        <NetbiosName>{netbios_name}</NetbiosName>
+                        <Site>Default-First-Site-Name</Site>
+                    </GetADDomainControllerResult>
+                </GetADDomainControllerResponse>"""
+
+        # CASE 2: Client wants Domain Info (This is what your log shows)
+        elif 'GetADDomain' in action:
+            response_action = "http://schemas.microsoft.com/2008/1/ActiveDirectory/CustomActions/TopologyManagement/GetADDomainResponse"
+            body_content = f"""
+                <GetADDomainResponse xmlns="http://schemas.microsoft.com/2008/1/ActiveDirectory/CustomActions/TopologyManagement">
+                    <GetADDomainResult>
+                        <DistinguishedName>{distinguished_name}</DistinguishedName>
+                        <DNSRoot>{dns_hostname}</DNSRoot>
+                        <NetBIOSName>{netbios_name}</NetBIOSName>
+                    </GetADDomainResult>
+                </GetADDomainResponse>"""
+        
+        else:
+            log.error(f"Unknown Topology Action requested: {action}")
+            return None
+
+        return f"""<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing">
+    <s:Header>
+        <a:Action s:mustUnderstand="1">{response_action}</a:Action>
+        <a:RelatesTo>{message_id}</a:RelatesTo>
+    </s:Header>
+    <s:Body>{body_content}</s:Body>
+</s:Envelope>"""
 
 if __name__ == '__main__':
     from IPython import embed
