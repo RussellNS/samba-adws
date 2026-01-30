@@ -348,42 +348,44 @@ class SamDBHelper(SamDB):
         distinguished_name = str(res[0].get("defaultNamingContext", "DC=vlab,DC=test"))
         netbios_name = dns_hostname.split('.')[0].upper()
 
-        # CASE 1: Client wants Domain Controller Info
+        # CASE 1: Get-ADDomainController
         if 'GetADDomainController' in action:
             response_action = "http://schemas.microsoft.com/2008/1/ActiveDirectory/Topology/GetADDomainControllerResponse"
-            body_content = f"""
-                <GetADDomainControllerResponse xmlns="http://schemas.microsoft.com/2008/1/ActiveDirectory/Topology">
-                    <GetADDomainControllerResult>
-                        <DestinationServer>{dns_hostname}</DestinationServer>
-                        <HostName>{dns_hostname}</HostName>
-                        <NetbiosName>{netbios_name}</NetbiosName>
-                        <Site>Default-First-Site-Name</Site>
-                    </GetADDomainControllerResult>
-                </GetADDomainControllerResponse>"""
+            body_content = (
+                f'<GetADDomainControllerResponse xmlns="http://schemas.microsoft.com/2008/1/ActiveDirectory/Topology">'
+                f'<GetADDomainControllerResult>'
+                f'<DestinationServer>{dns_hostname}</DestinationServer>'
+                f'<HostName>{dns_hostname}</HostName>'
+                f'<NetbiosName>{netbios_name}</NetbiosName>'
+                f'<Site>Default-First-Site-Name</Site>'
+                f'</GetADDomainControllerResult>'
+                f'</GetADDomainControllerResponse>'
+            )
 
-        # CASE 2: Client wants Domain Info
+        # CASE 2: Get-ADDomain
         elif 'GetADDomain' in action:
             response_action = "http://schemas.microsoft.com/2008/1/ActiveDirectory/CustomActions/TopologyManagement/GetADDomainResponse"
-            body_content = f"""
-                <GetADDomainResponse xmlns="http://schemas.microsoft.com/2008/1/ActiveDirectory/CustomActions/TopologyManagement">
-                    <GetADDomainResult>
-                        <DistinguishedName>{distinguished_name}</DistinguishedName>
-                        <DNSRoot>{dns_hostname}</DNSRoot>
-                        <NetBIOSName>{netbios_name}</NetBIOSName>
-                    </GetADDomainResult>
-                </GetADDomainResponse>"""
-        
+            # Note: The result often needs to be explicitly namespaced or contain the identity
+            body_content = (
+                f'<GetADDomainResponse xmlns="http://schemas.microsoft.com/2008/1/ActiveDirectory/CustomActions/TopologyManagement">'
+                f'<GetADDomainResult xmlns:ad="http://schemas.microsoft.com/2008/1/ActiveDirectory">'
+                f'<ad:DistinguishedName>{distinguished_name}</ad:DistinguishedName>'
+                f'<ad:DNSRoot>{dns_hostname}</ad:DNSRoot>'
+                f'<ad:NetBIOSName>{netbios_name}</ad:NetBIOSName>'
+                f'</GetADDomainResult>'
+                f'</GetADDomainResponse>'
+            )
         else:
-            log.error(f"Unknown Topology Action requested: {action}")
             return None
 
-        return f"""<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing">
-    <s:Header>
-        <a:Action s:mustUnderstand="1">{response_action}</a:Action>
-        <a:RelatesTo>{message_id}</a:RelatesTo>
-    </s:Header>
-    <s:Body>{body_content}</s:Body>
-</s:Envelope>"""
+        # Return the envelope with NO leading whitespace in the body
+        return (f'<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing">'
+                f'<s:Header>'
+                f'<a:Action s:mustUnderstand="1">{response_action}</a:Action>'
+                f'<a:RelatesTo>{message_id}</a:RelatesTo>'
+                f'</s:Header>'
+                f'<s:Body>{body_content}</s:Body>'
+                f'</s:Envelope>')
 
 if __name__ == '__main__':
     from IPython import embed
