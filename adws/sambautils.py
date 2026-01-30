@@ -361,7 +361,7 @@ class SamDBHelper(SamDB):
                     </GetADDomainControllerResult>
                 </GetADDomainControllerResponse>"""
 
-        # CASE 2: Client wants Domain Info (This is what your log shows)
+        # CASE 2: Client wants Domain Info
         elif 'GetADDomain' in action:
             response_action = "http://schemas.microsoft.com/2008/1/ActiveDirectory/CustomActions/TopologyManagement/GetADDomainResponse"
             body_content = f"""
