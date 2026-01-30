@@ -48,7 +48,8 @@ locatestarttagend = re.compile(r"""
   \s* # trailing whitespace
 """, re.VERBOSE)
 endendtag = re.compile('>')
-endtagfind = re.compile('</\s*([a-zA-Z][-.a-zA-Z0-9:_]*)\s*>')
+#endtagfind = re.compile('</\s*([a-zA-Z][-.a-zA-Z0-9:_]*)\s*>')
+endtagfind = re.compile(r'</\s*([a-zA-Z][-.a-zA-Z0-9:_]*)\s*>')
 
 class HTMLParseError(Exception):
     """Exception raised for all parse errors."""
@@ -245,7 +246,7 @@ class HTMLParser(markupbase.ParserBase):
             i = self.updatepos(i, n)
         self.rawdata = rawdata[i:]
 
-# --- Internal Parsing Methods ---
+    # --- Internal Parsing Methods ---
 
     def parse_pi(self, i):
         """Internal -- parse processing instruction, return end or -1."""
@@ -356,42 +357,43 @@ class HTMLParser(markupbase.ParserBase):
 
     # --- Overridable Handlers (Stubs) ---
     def handle_startendtag(self, tag, attrs):
-      """
-      Finish processing of start+end tag: <tag.../>
-      """
+        """
+        Overridable -- Finish processing of start+end tag: <tag.../>
+        """
         self.handle_starttag(tag, attrs)
         self.handle_endtag(tag)
 
-    # Overridable -- handle start tag
-    def handle_starttag(self, tag, attrs): pass
+    # --- Overridable Handlers (Stubs for derived classes) ---
+    def handle_starttag(self, tag, attrs): 
+        pass
 
-    # Overridable -- handle end tag
-    def handle_endtag(self, tag): pass
+    def handle_endtag(self, tag): 
+        pass
 
-    # Overridable -- handle character reference
-    def handle_charref(self, name): pass
+    def handle_charref(self, name): 
+        pass
 
-    # Overridable -- handle entity reference
-    def handle_entityref(self, name): pass
+    def handle_entityref(self, name): 
+        pass
 
-    # Overridable -- handle entity reference
-    def handle_data(self, data): pass
+    def handle_data(self, data): 
+        pass
 
-    # Overridable -- handle comment
-    def handle_comment(self, data): pass
+    def handle_comment(self, data): 
+        pass
 
-    # Overridable -- handle declaration
-    def handle_decl(self, decl): pass
+    def handle_decl(self, decl): 
+        pass
 
-    # Overridable -- handle processing instruction
-    def handle_pi(self, data): pass
+    def handle_pi(self, data): 
+        pass
 
     def unknown_decl(self, data):
         self.error(f"unknown declaration: {data!r}")
 
     # --- Entity Unescaping Logic ---
-    # Internal -- helper to remove special character quoting
     entitydefs = None
+
     def unescape(self, s):
         """
         Refactored for Python 3.13. 
@@ -401,15 +403,17 @@ class HTMLParser(markupbase.ParserBase):
             return s
         
         def replaceEntities(m):
-            s = m.group(1)
+            entity_content = m.group(1)
             try:
-                if s[0] == "#":
-                    s = s[1:]
-                    # Hex vs Decimal character references
-                    c = int(s[1:], 16) if s[0].lower() == 'x' else int(s)
+                if entity_content[0] == "#":
+                    content = entity_content[1:]
+                    if content[0].lower() == 'x':
+                        c = int(content[1:], 16)
+                    else:
+                        c = int(content)
                     return chr(c)
             except (ValueError, OverflowError):
-                return f'&#{s};'
+                return f'&#{entity_content};'
             else:
                 if HTMLParser.entitydefs is None:
                     # Load standard HTML entities for Python 3
@@ -423,8 +427,8 @@ class HTMLParser(markupbase.ParserBase):
                     for k, v in htmlentitydefs.name2codepoint.items():
                         HTMLParser.entitydefs[k] = chr(v)
                 try:
-                    return HTMLParser.entitydefs[s]
+                    return HTMLParser.entitydefs[entity_content]
                 except KeyError:
-                    return f'&{s};'
+                    return f'&{entity_content};'
 
         return re.sub(r"&(#?[xX]?(?:[0-9a-fA-F]+|\w{1,8}));", replaceEntities, s)
