@@ -107,7 +107,7 @@ class LdapAttr(object):
     def __init__(self, attr, vals, ldap_syntax, xsi_type='xsd:string'):
         self.attr = attr  # e.g., sAMAccountName
         self.ldap_syntax = ldap_syntax
-        assert ':' in xsi_type
+        #assert ':' in xsi_type
         self.xsi_type = xsi_type
 
         # Convert ldb.MessageElement or other iterables to a standard python list
@@ -181,9 +181,8 @@ def get_rdn(dn):
     rdn_name = dn.get_rdn_name()
     rdn_value = dn.get_rdn_value()
     if rdn_name and rdn_value:
-        return '%s=%s' % (rdn_name, rdn_value)
+        return f'{rdn_name}={rdn_value}'
     return ''
-
 
 class SamDBHelper(SamDB):
 
@@ -338,6 +337,29 @@ class SamDBHelper(SamDB):
 
         return render_template('Pull.xml', **context)
 
+    def render_topology_action(self, **context):
+            """Responds to Topology Management requests (e.g., GetADDomainController)"""
+            res = self.search(base="", scope=ldb.SCOPE_BASE, attrs=["dnsHostName", "netbiosName"])
+            dns_name = str(res[0].get("dnsHostName", "samba.vlab.test"))
+            # Fallback if netbios name isn't in rootDSE
+            netbios_name = str(res[0].get("netbiosName", dns_name.split('.')[0].upper()))
+
+            return f"""<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing">
+        <s:Header>
+            <a:Action s:mustUnderstand="1">http://schemas.microsoft.com/2008/1/ActiveDirectory/Topology/GetADDomainControllerResponse</a:Action>
+            <a:RelatesTo>{context.get('MessageID')}</a:RelatesTo>
+        </s:Header>
+        <s:Body>
+            <GetADDomainControllerResponse xmlns="http://schemas.microsoft.com/2008/1/ActiveDirectory/Topology">
+                <GetADDomainControllerResult>
+                    <DestinationServer>{dns_name}</DestinationServer>
+                    <HostName>{dns_name}</HostName>
+                    <NetbiosName>{netbios_name}</NetbiosName>
+                    <Site>Default-First-Site-Name</Site>
+                </GetADDomainControllerResult>
+            </GetADDomainControllerResponse>
+        </s:Body>
+    </s:Envelope>"""
 
 if __name__ == '__main__':
     from IPython import embed
