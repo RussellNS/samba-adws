@@ -1,3 +1,10 @@
+# Active Directory Web Services (ADWS) Proxy for Samba
+
+> [!NOTE]
+> NOTE: This is a fork of the [Catalyst Samba-ADWS Project on GitLab](https://gitlab.com/catalyst-samba/samba-adws) as referenced on the [AD PowerShell compatibility](https://wiki.samba.org/index.php/ADWS_/_AD_Powershell_compatibility) page on [SambaWiki](https://wiki.samba.org/index.php/Main_Page).  The original project (2018) was based on an older version of Samba, older libraries, and Python 2.x.  In short, it doesn’t work today (2026).  The goal of this fork is to ride the coattails of giants, use AI, and get it working.
+
+---
+
 .Net netTcp WCF Binding Framwork
 ================================
 
