@@ -44,7 +44,7 @@ def print_xml(xml, sn=0, mode='w+'):
     # xml2 = etree.tostring(root, pretty_print=True)
     # print(xml2)
     # print('######################XML TAIL##########################')
-    with open('/vagrant/%s.xml' % sn, mode) as f:
+    with open('/tmp/%s.xml' % sn, mode) as f:
         f.write(xml + '\n\n\n')
 
 
