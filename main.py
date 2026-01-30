@@ -251,9 +251,14 @@ class NETTCPProxy(SocketServer.BaseRequestHandler):
                         context.update(enumeration_context)
                         ack_xml = samdbhelper.render_pull(**context)
 
+                # Action: Topology (New)
+                elif context['Action'] and 'Topology' in context['Action']:
+                    log.info(f"Handling Topology Action: {context['Action']}")
+                    ack_xml = samdbhelper.render_topology_action(**context)
+
                 # --- Response Construction ---
                 if not ack_xml:
-                    log.error('Unhandled SOAP Action or missing response XML')
+                    log.error(f"Unhandled SOAP Action or missing response XML for Action: {context['Action']}")
                     break
 
                 xmlutils.print_xml(ack_xml, request_index, mode='a')
