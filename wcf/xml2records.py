@@ -266,7 +266,7 @@ class XMLParser(HTMLParser):
     handle_decl = handle_data
 
     def handle_comment(self, comment):
-        if data:
+        if self.data:
             self._store_data(self.data, False)
             self.data = None
             self.is_cdata = False
