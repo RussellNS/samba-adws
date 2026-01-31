@@ -306,16 +306,21 @@ class SamDBHelper(SamDB):
         MaxElements = context['MaxElements']
 
         scope = SCOPE_ADLQ_TO_LDB[LdapQuery['Scope'].lower()]
+        
+        # Ensure 'objectClass' is fetched so we can determine the XML tag
+        search_attrs = list(attr_names)
+        if 'objectClass' not in search_attrs:
+            search_attrs.append('objectClass')
+
         result = self.search(
             base=LdapQuery['BaseObject'],
             scope=scope,
             expression=LdapQuery['Filter'],
-            attrs=attr_names,
+            attrs=search_attrs,
             controls=['paged_results:1:%s%s' % (MaxElements, cookie)]
         )
 
-        ctrls = [str(c) for c in result.controls if
-                 str(c).startswith("paged_results")]
+        ctrls = [str(c) for c in result.controls if str(c).startswith("paged_results")]
         
         # Safety check for controls
         if ctrls:
@@ -327,14 +332,27 @@ class SamDBHelper(SamDB):
             else:
                 context['is_end'] = True
         else:
-             context['is_end'] = True
+            context['is_end'] = True
 
-        objects = [
-            self.build_attr_list(msg, attr_names=attr_names)
-            for msg in result.msgs
-        ]
+        # Build a list of dictionaries containing the type and the attributes
+        objects = []
+        for msg in result.msgs:
+            # 1. Determine the object type for the XML wrapper tag
+            # Samba returns objectClass as a list (e.g., ['top', 'person', 'user'])
+            raw_oc = msg.get("objectClass", ["adObject"])
+            obj_type = str(raw_oc[-1]) # Use the most specific class
+            
+            # 2. ADWS Specific mapping: domainDNS objects must be tagged as <addata:domain>
+            if obj_type == "domainDNS":
+                obj_type = "domain"
+            
+            # 3. Build the attribute list for this specific object
+            objects.append({
+                'type': obj_type,
+                'attrs': self.build_attr_list(msg, attr_names=attr_names)
+            })
+
         context['objects'] = objects
-
         return render_template('Pull.xml', **context)
 
     def render_topology_action(self, **context):
