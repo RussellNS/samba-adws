@@ -1,12 +1,17 @@
 # Active Directory Web Services (ADWS) Proxy for Samba
 
 > [!NOTE]
-> NOTE: This is a fork of the [Catalyst Samba-ADWS Project on GitLab](https://gitlab.com/catalyst-samba/samba-adws) as referenced on the [AD PowerShell compatibility](https://wiki.samba.org/index.php/ADWS_/_AD_Powershell_compatibility) page on [SambaWiki](https://wiki.samba.org/index.php/Main_Page).  The original project (2018) was based on an older version of Samba, older libraries, and Python 2.x.  In short, it doesn’t work today (2026).  The goal of this fork is to ride the coattails of giants, use AI, and get it working.
+> NOTE: This is a fork of the [Catalyst Samba-ADWS Project on GitLab](https://gitlab.com/catalyst-samba/samba-adws) as referenced on the [AD PowerShell compatibility](https://wiki.samba.org/index.php/ADWS_/_AD_Powershell_compatibility) page on [SambaWiki](https://wiki.samba.org/index.php/Main_Page).  The original project (2018) was:
+>
+> - Based on an older version of Samba and older libraries
+> - Scripts were hard coded to use Python 2.x even though the original project stated it was “…meant to be run/installed with python3.”
+> - Was also hard coded to only work with returns from the ‘Get-ADComputer’ command.  Meaning, no other PowerShell cmdlets that use ADWS would work (like 'Get-ADDomain’, ‘Get-ADUser‘, etc.).
+>
+> In short, it was a noble proof of concept in 2018, but it doesn’t work today (2026).  The goal of this fork is to ride the coattails of giants, use AI, get it working, and extend the functionality to work with more PowerShell cmdlets as well as (hopefully) get it working with Active Directory Administrative Center (ADAC).
 
 ---
 
-.Net netTcp WCF Binding Framwork
-================================
+# .Net netTcp WCF Binding Framwork
 
 This library implements the MC-NMF, MC-NMFTB and MS-NNS protocols for net.tcp
 webservices. It is able to parse and encode the different protocols and interact
@@ -16,12 +21,11 @@ This library is meant to be run/installed with **python3**. It should also work 
 (possibly required with GSSAPI). Ensure not to run the proxy.py file directly, as it requires
 to be part of a python package. Use **nettcp-proxy** instead.
 
-<a href="https://asciinema.org/a/71sbvkyjpr0jpmznk36u3ec9q" target="_blank">
+<a href="https://asciinema.org/a/71sbvkyjpr0jpmznk36u3ec9q" target="\_blank">
 <img src="https://asciinema.org/a/71sbvkyjpr0jpmznk36u3ec9q.png" />
 </a>
 
-Parse data
-----------
+## Parse data
 
 Code:
 
@@ -34,14 +38,15 @@ while stream.tell() < len(data):
 ```
 
 From trace file (captured by proxy)
+
 ```bash
 decode-nmf foo.trace
 ```
 
-Connect to service
-------------------
+## Connect to service
 
 Unencrypted:
+
 ```python
 import socket
 from nettcp.stream.socket import SocketStream
@@ -58,11 +63,13 @@ stream.write('...')
 With GSSAPI:
 
 requesting ticket with krb5
+
 ```bash
 kvno host/foo.example.com
 ```
 
 authenticate with python
+
 ```python
 import socket
 from nettcp.stream.socket import SocketStream
@@ -76,16 +83,13 @@ stream.preamble()
 stream.write('...')
 ```
 
-
-Capture connection
-------------------
+## Capture connection
 
 ```bash
 nettcp-proxy.py -b <localaddr> -p <localport> -t logfile.trace <targetserver> <targetport>
 ```
 
-Man-in-the-Middle of netTcp with negotiate stream
--------------------------------------------------
+## Man-in-the-Middle of netTcp with negotiate stream
 
 ```bash
 kinit user/foo.example.com
