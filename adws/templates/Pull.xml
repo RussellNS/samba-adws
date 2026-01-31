@@ -1,38 +1,23 @@
-<s:Envelope
-        xmlns:a="http://www.w3.org/2005/08/addressing" 
-        xmlns:s="http://www.w3.org/2003/05/soap-envelope">
-        <s:Header>
-            <a:Action s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2004/09/enumeration/PullResponse</a:Action>
-            <a:RelatesTo>{{MessageID}}</a:RelatesTo>
-        </s:Header>
-        <s:Body>
-            <wsen:PullResponse
-                xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
-                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
-                xmlns:addata="http://schemas.microsoft.com/2008/1/ActiveDirectory/Data" 
-                xmlns:ad="http://schemas.microsoft.com/2008/1/ActiveDirectory" 
-                xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
-                <!--
-                    Updated: <wsen:Items> ... </wsen:Items>
-                    Reason:  This XML node was hard coded to only pull
-                             computer objects from AD.  Meaning,
-                             'Get-ADComputer' worked, and no other AD
-                             PowerShell cmdlets worked.
-                -->
-                <wsen:Items>
-                    {% for obj in objects %}
-                    <addata:{{ obj.type }}>
-                        {% for attr in obj.attrs %}
-                        {{ attr.to_xml()|safe }}
-                        {% endfor %}
-                    </addata:{{ obj.type }}>
+<s:Envelope xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+    <s:Header>
+        <a:Action s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2004/09/enumeration/PullResponse</a:Action>
+        <a:RelatesTo>{{MessageID}}</a:RelatesTo>
+    </s:Header>
+    <s:Body>
+        <wsen:PullResponse xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration" 
+                           xmlns:addata="http://schemas.microsoft.com/2008/1/ActiveDirectory/Data">
+            <wsen:Items>
+                {% for obj in objects %}
+                <addata:{{ obj.type }}>
+                    {% for attr in obj.attrs %}
+                    {{ attr.to_xml()|safe }}
                     {% endfor %}
-                </wsen:Items>
-                {% if is_end %}
-                <wsen:EndOfSequence
-                    xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
-                </wsen:EndOfSequence>
-                {% endif %}
-            </wsen:PullResponse>
-        </s:Body>
-    </s:Envelope>
+                </addata:{{ obj.type }}>
+                {% endfor %}
+            </wsen:Items>
+            {% if is_end %}
+            <wsen:EndOfSequence />
+            {% endif %}
+        </wsen:PullResponse>
+    </s:Body>
+</s:Envelope>
