@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
 Script Modified:  2026-Jun-14
-Script Version:   1.1.2
+Script Version:   1.1.3
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -66,6 +66,15 @@ Change Log:
            the WS-CustomActions capability handshake that Get-ADDomain,
            Get-ADForest, and Get-ADDomainController send before
            fetching data. Fixes ADServerDownException on those cmdlets.
+  1.1.3  - Wildcard attribute fix. PowerShell sends 'ad:all' as the
+           last SelectionProperty when the caller uses -Properties *.
+           Previously 'all' was passed as a literal LDB attribute name
+           which LDB silently ignored, causing sparse results. When
+           'ad:all' is detected, render_pull() now passes attrs=None
+           to the LDB search (returning all attributes) and passes an
+           empty attr_names list to build_attr_list() so all returned
+           attributes are rendered in the response. Fixes Get-ADDomain,
+           Get-ADForest, and Get-ADDomainController data population.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -73,6 +82,8 @@ To Do List:
   *  Implement MS-ADCAP custom operations (password change, unlock, etc.).
 ------------------------------------------------------------------------------
 """
+
+
 from __future__ import print_function, absolute_import
 import ldb
 import re
@@ -85,7 +96,6 @@ from os.path import abspath, dirname, join
 import jinja2
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from base64 import b64encode
-
 
 
 # ========================================================================== #
@@ -110,7 +120,6 @@ SYNTAX_GENERALIZED_TIME  = getattr(ldb, 'SYNTAX_GENERALIZED_TIME',  1)
 SYNTAX_OBJECT_IDENTIFIER = getattr(ldb, 'SYNTAX_OBJECT_IDENTIFIER', 1)
 
 
-
 # ========================================================================== #
 # XML 1.0 Illegal Character Pattern                                          #
 # ========================================================================== #
@@ -133,7 +142,6 @@ XML_ILLEGAL_CHARS = re.compile(
 )
 
 
-
 # ========================================================================== #
 # Jinja2 Template Engine Setup                                               #
 # ========================================================================== #
@@ -153,7 +161,6 @@ ENV = Environment(
 )
 
 
-
 # ========================================================================== #
 # LDAP Scope Mapping                                                         #
 # ========================================================================== #
@@ -169,7 +176,6 @@ SCOPE_ADLQ_TO_LDB = {
 }
 
 
-
 # ========================================================================== #
 # Root DSE Sentinel GUID                                                     #
 # ========================================================================== #
@@ -180,7 +186,6 @@ SCOPE_ADLQ_TO_LDB = {
 # object.
 
 ROOT_DSE_GUID = '11111111-1111-1111-1111-111111111111'
-
 
 
 # ========================================================================== #
@@ -214,7 +219,6 @@ class SchemaSyntax(object):
 
     def render(self):
         return 'xml'
-
 
 
 SCHEMA_SYNTAX_LIST = [
@@ -259,7 +263,6 @@ ROOT_DSE_ATTRS = {
 }
 
 
-
 # ========================================================================== #
 # LdapAttr                                                                   #
 # ========================================================================== #
@@ -291,7 +294,6 @@ LDAP_ATTR_TEMPLATE = jinja2.Template("""
    <ad:value xsi:type="{{obj.xsi_type}}">{{val}}</ad:value>
    {%- endfor %}
 </addata:{{obj.attr}}>""".strip())
-
 
 
 class LdapAttr(object):
@@ -344,7 +346,6 @@ class LdapAttr(object):
         return LDAP_ATTR_TEMPLATE.render({'obj': self})
 
 
-
 # ========================================================================== #
 # SyntheticAttr                                                              #
 # ========================================================================== #
@@ -378,7 +379,6 @@ SYNTHETIC_ATTR_TEMPLATE = jinja2.Template("""
 </ad:{{obj.attr}}>""".strip())
 
 
-
 class SyntheticAttr(object):
 
     def __init__(self, attr, vals, xsi_type='xsd:string'):
@@ -406,7 +406,6 @@ class SyntheticAttr(object):
         return SYNTHETIC_ATTR_TEMPLATE.render({'obj': self})
 
 
-
 # ========================================================================== #
 # Helper Functions                                                           #
 # ========================================================================== #
@@ -422,13 +421,11 @@ def render_template(template_name, **kwargs):
     return template.render(**kwargs)
 
 
-
 def is_rootDSE(guid):
     """
     Return True if the given GUID string is the sentinel Root DSE GUID.
     """
     return guid.strip() == ROOT_DSE_GUID
-
 
 
 def get_rdn(dn):
@@ -444,7 +441,6 @@ def get_rdn(dn):
     if rdn_name and rdn_value:
         return '%s=%s' % (rdn_name, rdn_value)
     return ''
-
 
 
 # ========================================================================== #
@@ -700,8 +696,8 @@ class SamDBHelper(SamDB):
         control, and return the matching objects wrapped in the correct
         object-class XML tags.
 
-        Generic object class fix (v1.10)
-        ---------------------------------
+        Generic object class fix (v1.1.0)
+        ----------------------------------
         Previously Pull.xml hardcoded <addata:computer> for every
         result object, which meant only Get-ADComputer worked.
 
@@ -738,16 +734,36 @@ class SamDBHelper(SamDB):
 
         scope = SCOPE_ADLQ_TO_LDB[LdapQuery['Scope'].lower()]
 
-        # Always include objectClass in the LDB query so we can
-        # determine the correct XML wrapper tag for each result object.
-        # Track whether the client asked for it so we can strip it from
-        # the rendered attr list if they did not.
-        client_requested_objectclass = 'objectClass' in attr_names
-        attrs_to_fetch = (
-            attr_names
-            if client_requested_objectclass
-            else attr_names + ['objectClass']
-        )
+        # Wildcard detection (v1.1.3)
+        # PowerShell sends 'ad:all' as the final SelectionProperty when
+        # the caller uses -Properties *. After stripping the namespace
+        # prefix it becomes the literal string 'all', which is not a
+        # valid LDB attribute name. LDB silently ignores it and returns
+        # only the other named attributes, producing sparse results that
+        # cause cmdlets like Get-ADDomain to report object-not-found.
+        #
+        # When 'all' is present we remove it from attr_names and pass
+        # attrs=None to the LDB search, which tells Samba to return
+        # every attribute on the object. We also set
+        # client_requested_objectclass=True so objectClass is always
+        # included in the result (LDB returns it regardless when
+        # attrs=None, and we need it for the XML tag rewrite).
+        fetch_all = 'all' in attr_names
+        if fetch_all:
+            attr_names = [a for a in attr_names if a != 'all']
+            attrs_to_fetch          = None
+            client_requested_objectclass = True
+        else:
+            # Always include objectClass in the LDB query so we can
+            # determine the correct XML wrapper tag for each result.
+            # Track whether the client asked for it so we can strip it
+            # from the rendered attr list if they did not.
+            client_requested_objectclass = 'objectClass' in attr_names
+            attrs_to_fetch = (
+                attr_names
+                if client_requested_objectclass
+                else attr_names + ['objectClass']
+            )
 
         result = self.search(
             base=LdapQuery['BaseObject'],
@@ -794,9 +810,15 @@ class SamDBHelper(SamDB):
                 else 'top'  # safe fallback; should not occur in practice
             )
 
-            # Build attr list using only what the client asked for.
-            # objectClass is excluded unless the client requested it.
-            attrs = self.build_attr_list(msg, attr_names=attr_names)
+            # When fetch_all is True, pass an empty attr_names list
+            # so build_attr_list() derives the list from msg.keys()
+            # and renders every attribute LDB returned. When False,
+            # pass attr_names so only the requested attrs are rendered
+            # and objectClass is excluded unless the client asked for it.
+            attrs = self.build_attr_list(
+                msg,
+                attr_names=[] if fetch_all else attr_names
+            )
 
             objects.append((object_class, attrs))
 
@@ -836,7 +858,6 @@ class SamDBHelper(SamDB):
 
         context['action_name'] = action_name
         return render_template('topology-action.xml', **context)
-
 
 
 # ========================================================================== #
