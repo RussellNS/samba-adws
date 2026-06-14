@@ -1,27 +1,75 @@
-#!/usr/bin/env python3
-# ============================================================================
-# Script Name  : sambautils.py
-# Author       : RussellNS
-# Forked From  : Catalyst Samba-ADWS Project on GitLab
-# Original URL : https://gitlab.com/catalyst-samba/samba-adws
-# Purpose      : Core AD backend for the ADWS proxy. Provides the
-#                SamDBHelper class which connects to the local Samba LDB
-#                database and handles all LDAP queries. Also defines the
-#                attribute model (LdapAttr, SyntheticAttr) and Jinja2
-#                template rendering used to produce SOAP/XML responses
-#                for every ADWS action.
-# ============================================================================
-# Change Log  :
-#   v1.0.0  - Python 3.13 compatibility refactor. ldb constant polyfill,
-#               bytes/binary handling, SamDB subclass pattern.
-#   v1.1.0  - Generic object class fix. render_pull() now passes
-#               (object_class, attrs) tuples to Pull.xml so that any
-#               AD object type (user, group, OU, etc.) is wrapped in
-#               the correct <addata:X> tag instead of the hardcoded
-#               <addata:computer>.
-# ============================================================================
+"""
+------------------------------------------------------------------------------
+Script Name:      sambautils.py
+Script Author:    Neal Russell
+Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
+Script Created:   2024-Jan-01
+Script Modified:  2026-Jun-14
+Script Version:   1.1.1
+Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
+                  attribute models, Jinja2 template rendering, and the
+                  SamDBHelper class which connects to the local Samba LDB
+                  database and handles all LDAP queries.
+
+Script Desc:      This module is imported by main.py and is never executed
+                  directly (except in interactive/debug mode -- see the
+                  __main__ block at the bottom of this file).
+
+                  1.  ldb constant polyfill -- getattr() guards against
+                      missing OID constants across Samba versions.
+
+                  2.  XML_ILLEGAL_CHARS -- compiled regex that matches
+                      characters which are valid UTF-8 but illegal in
+                      XML 1.0 (e.g. \x01 SOH). Used by LdapAttr to
+                      decide whether a decoded string must be
+                      base64-encoded before it is placed into XML.
+
+                  3.  SchemaSyntax / registry -- maps LDAP OIDs to the
+                      LdapSyntax names and XSD types that Windows expects
+                      in ADWS responses.
+
+                  4.  LdapAttr -- wraps one LDB attribute and its values.
+                      Handles bytes-to-string decoding, base64 fallback
+                      for binary data, and XML illegal-character detection.
+                      Renders itself to XML via LDAP_ATTR_TEMPLATE.
+
+                  5.  SyntheticAttr -- wraps computed attributes that do
+                      not exist in LDB but are required by the ADWS
+                      protocol (objectReferenceProperty, distinguishedName,
+                      etc.). Renders itself to XML via
+                      SYNTHETIC_ATTR_TEMPLATE.
+
+                  6.  SamDBHelper -- subclasses SamDB to add ADWS-specific
+                      render_*() methods. Each render method handles one
+                      ADWS SOAP action: Root DSE lookup, WS-Transfer Get,
+                      WS-Enumeration Enumerate, and WS-Enumeration Pull.
+
+------------------------------------------------------------------------------
+Execution Context: Imported by main.py. Not a standalone executable.
+                   Requires a running Samba AD DC with a readable sam.ldb.
+------------------------------------------------------------------------------
+Change Log:
+  1.0.0  - Python 3.13 compatibility refactor. ldb constant polyfill,
+           bytes/binary handling, SamDB subclass pattern.
+  1.1.0  - Generic object class fix. render_pull() now passes
+           (object_class, attrs) tuples to Pull.xml so that any AD
+           object type (user, group, OU, etc.) is wrapped in the correct
+           <addata:X> tag instead of the hardcoded <addata:computer>.
+  1.1.1  - XML 1.0 illegal character fix. LdapAttr now detects control
+           characters (e.g. \x01) that are valid UTF-8 but illegal in
+           XML, and base64-encodes those values rather than letting lxml
+           raise XMLSyntaxError and crash the connection handler. This
+           fixes the Get-ADGroup failure observed in testing.
+------------------------------------------------------------------------------
+To Do List:
+  *  Implement WS-Transfer Put (Set-AD* cmdlets).
+  *  Implement WS-Transfer Create / Delete (New-AD* / Remove-AD*).
+  *  Implement MS-ADCAP custom operations (password change, unlock, etc.).
+------------------------------------------------------------------------------
+"""
 from __future__ import print_function, absolute_import
 import ldb
+import re
 import samba
 from samba.samdb import SamDB
 from samba.param import LoadParm
@@ -33,10 +81,9 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from base64 import b64encode
 
 
-
-# ============================================================================
-# ldb Constant Polyfill
-# ============================================================================
+# ========================================================================== #
+# ldb Constant Polyfill                                                      #
+# ========================================================================== #
 # The python3-ldb package does not consistently expose OID constants
 # across all Samba versions. getattr() with a fallback prevents
 # AttributeErrors at import time on systems where a constant is missing.
@@ -44,27 +91,50 @@ from base64 import b64encode
 # absent it means the installed Samba version does not support that
 # syntax, which will surface as a missing syntax lookup rather than a
 # hard crash.
-# ============================================================================
-SYNTAX_INTEGER          = getattr(ldb, 'SYNTAX_INTEGER',          1)
-SYNTAX_LARGE_INTEGER    = getattr(ldb, 'SYNTAX_LARGE_INTEGER',    1)
-SYNTAX_BOOLEAN          = getattr(ldb, 'SYNTAX_BOOLEAN',          1)
-SYNTAX_DIRECTORY_STRING = getattr(ldb, 'SYNTAX_DIRECTORY_STRING', 1)
-SYNTAX_OCTET_STRING     = getattr(ldb, 'SYNTAX_OCTET_STRING',     1)
-SYNTAX_DN               = getattr(ldb, 'SYNTAX_DN',               1)
-SYNTAX_UTC_TIME         = getattr(ldb, 'SYNTAX_UTC_TIME',         1)
-SYNTAX_GENERALIZED_TIME = getattr(ldb, 'SYNTAX_GENERALIZED_TIME', 1)
-SYNTAX_OBJECT_IDENTIFIER= getattr(ldb, 'SYNTAX_OBJECT_IDENTIFIER',1)
 
-# ============================================================================
-# Jinja2 Template Engine Setup
-# ============================================================================
+SYNTAX_INTEGER           = getattr(ldb, 'SYNTAX_INTEGER',           1)
+SYNTAX_LARGE_INTEGER     = getattr(ldb, 'SYNTAX_LARGE_INTEGER',     1)
+SYNTAX_BOOLEAN           = getattr(ldb, 'SYNTAX_BOOLEAN',           1)
+SYNTAX_DIRECTORY_STRING  = getattr(ldb, 'SYNTAX_DIRECTORY_STRING',  1)
+SYNTAX_OCTET_STRING      = getattr(ldb, 'SYNTAX_OCTET_STRING',      1)
+SYNTAX_DN                = getattr(ldb, 'SYNTAX_DN',                1)
+SYNTAX_UTC_TIME          = getattr(ldb, 'SYNTAX_UTC_TIME',          1)
+SYNTAX_GENERALIZED_TIME  = getattr(ldb, 'SYNTAX_GENERALIZED_TIME',  1)
+SYNTAX_OBJECT_IDENTIFIER = getattr(ldb, 'SYNTAX_OBJECT_IDENTIFIER', 1)
+
+
+# ========================================================================== #
+# XML 1.0 Illegal Character Pattern                                          #
+# ========================================================================== #
+# XML 1.0 prohibits certain control characters even when the string is
+# otherwise valid UTF-8. A value containing \x01 (SOH), \x02, \x03,
+# etc. will cause lxml to raise XMLSyntaxError when it tries to parse
+# the rendered XML, crashing the connection handler before a response
+# can be sent to PowerShell. The pattern below matches any character
+# that is illegal in XML 1.0.
+#
+# Legal character ranges per https://www.w3.org/TR/xml/#charsets :
+#   #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] |
+#   [#x10000-#x10FFFF]
+#
+# Any character NOT in those ranges must be base64-encoded to keep
+# the generated XML well-formed. Used in LdapAttr.__init__().
+
+XML_ILLEGAL_CHARS = re.compile(
+    r'[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]'
+)
+
+
+# ========================================================================== #
+# Jinja2 Template Engine Setup                                               #
+# ========================================================================== #
 # Templates live in the adws/templates/ directory alongside this file.
 # autoescape is enabled for XML to prevent injection through AD attribute
 # values that contain characters like <, >, or &. The |safe filter in
 # templates is used deliberately only for pre-rendered XML fragments
-# that we have already escaped ourselves (LdapAttr.to_xml /
-# SyntheticAttr.to_xml).
-# ============================================================================
+# that we have already escaped ourselves (LdapAttr.to_xml() /
+# SyntheticAttr.to_xml()).
+
 HERE      = dirname(abspath(__file__))
 TEMPLATES = join(HERE, 'templates')
 
@@ -73,14 +143,15 @@ ENV = Environment(
     autoescape=select_autoescape(['xml']),
 )
 
-# ============================================================================
-# LDAP Scope Mapping
-# ============================================================================
+
+# ========================================================================== #
+# LDAP Scope Mapping                                                         #
+# ========================================================================== #
 # PowerShell AD cmdlets express search scope using ADWS/LDAP dialect
 # strings ('base', 'onelevel', 'subtree'). This dict maps them to the
 # integer constants that python-ldb expects on search() calls.
 # Reference: https://msdn.microsoft.com/en-us/library/dd340513.aspx
-# =============================================================================
+
 SCOPE_ADLQ_TO_LDB = {
     'base':     ldb.SCOPE_BASE,
     'onelevel': ldb.SCOPE_ONELEVEL,
@@ -88,30 +159,41 @@ SCOPE_ADLQ_TO_LDB = {
 }
 
 
+# ========================================================================== #
+# Root DSE Sentinel GUID                                                     #
+# ========================================================================== #
+# The Root DSE is the top-level entry of an LDAP directory (like the
+# "/" of a filesystem). It has no real GUID in AD; Windows uses this
+# well-known fake GUID as a handle to request it. We match on this to
+# decide whether a Get request is asking for the Root DSE or a real
+# object.
 
-def render_template(template_name, **kwargs):
-    """
-    Load and render a Jinja2 template from the templates/ directory.
-
-    All keyword arguments are passed directly into the template context,
-    making them available as variables inside the XML template files.
-    """
-    template = ENV.get_template(template_name)
-    return template.render(**kwargs)
+ROOT_DSE_GUID = '11111111-1111-1111-1111-111111111111'
 
 
+# ========================================================================== #
+# Schema Syntax Registry                                                     #
+# ========================================================================== #
+# SchemaSyntax encapsulates the relationship between an LDAP OID, the
+# human-readable LdapSyntax name Windows expects in responses (e.g.
+# 'UnicodeString'), and the XSD type used in the SOAP envelope (e.g.
+# 'xsd:string' or 'xsd:base64Binary'). Every LDAP attribute type has
+# one of these.
+#
+# SCHEMA_SYNTAX_LIST contains one entry per syntax that appears in a
+# standard Samba AD schema. OID_SCHEMA_SYNTAX_DICT is keyed by OID for
+# O(1) lookup during attribute serialisation.
+#
+# ROOT_DSE_ATTRS maps Root DSE attribute names to their syntax OIDs.
+# The Root DSE is a virtual pseudo-entry with no schema record in LDB,
+# so its syntaxes are defined statically here per the ADWS spec
+# (MS-ADDM Appendix A <4>).
+# Reference: https://msdn.microsoft.com/en-us/library/dd340513.aspx
 
-# ============================================================================
-# SchemaSyntax
-# ============================================================================
-# Encapsulates the relationship between an LDAP OID, the human-readable
-# LdapSyntax name Windows expects in responses (e.g. 'UnicodeString'),
-# and the XSD type used in the SOAP envelope (e.g. 'xsd:string' or
-# 'xsd:base64Binary'). Every LDAP attribute type has one of these.
-# ============================================================================
 class SchemaSyntax(object):
+
     def __init__(self, oid, ldap_syntax, xsi_type='xsd:string'):
-        # OID string that uniquely identifies this LDAP syntax in the schema
+        # OID that uniquely identifies this LDAP syntax in the schema
         self.oid         = oid
         # Human-readable name sent in the LdapSyntax XML attribute
         self.ldap_syntax = ldap_syntax
@@ -122,35 +204,6 @@ class SchemaSyntax(object):
         return 'xml'
 
 
-
-# ============================================================================
-# Root DSE Sentinel GUID
-# ============================================================================
-# The Root DSE is the top-level entry of an LDAP directory (like the
-# "/" of a filesystem). It has no real GUID in AD; Windows uses this
-# well-known fake GUID as a handle to request it. We match on this to
-# decide whether a Get request is asking for the Root DSE or a real
-# object.
-# ============================================================================
-ROOT_DSE_GUID = '11111111-1111-1111-1111-111111111111'
-
-
-
-def is_rootDSE(guid):
-    """Return True if the given GUID string is the sentinel Root DSE GUID."""
-    return guid.strip() == ROOT_DSE_GUID
-
-
-
-# ============================================================================
-# Schema Syntax Registry
-# ============================================================================
-# Maps LDAP OIDs to SchemaSyntax instances. When we retrieve an
-# attribute from LDB, we look up its OID via
-# get_syntax_oid_from_lDAPDisplayName() and use this dict to find the
-# correct ldap_syntax and xsi_type for the XML response. Only the
-# syntaxes that appear in a standard Samba AD schema are listed here.
-# ============================================================================
 SCHEMA_SYNTAX_LIST = [
     SchemaSyntax(SYNTAX_INTEGER,           'Integer'),
     SchemaSyntax(SYNTAX_LARGE_INTEGER,     'LargeInteger'),
@@ -164,19 +217,8 @@ SCHEMA_SYNTAX_LIST = [
     SchemaSyntax(SYNTAX_OBJECT_IDENTIFIER, 'ObjectIdentifier'),
 ]
 
-# Keyed by OID for O(1) lookup during attribute serialisation
 OID_SCHEMA_SYNTAX_DICT = {obj.oid: obj for obj in SCHEMA_SYNTAX_LIST}
 
-# ============================================================================
-# Root DSE Attribute Syntax Map
-# ============================================================================
-# The Root DSE is a special pseudo-entry that does not have schema
-# entries in the usual place. Its attribute syntaxes are defined by the
-# ADWS spec (MS-ADDM Appendix A <4>) rather than looked up dynamically,
-# so we maintain a static dict here. Attributes not listed here will be
-# skipped during Root DSE serialisation.
-# Reference: https://msdn.microsoft.com/en-us/library/dd340513.aspx
-# ============================================================================
 ROOT_DSE_ATTRS = {
     'configurationNamingContext':    SYNTAX_DN,
     'currentTime':                   SYNTAX_GENERALIZED_TIME,
@@ -203,15 +245,32 @@ ROOT_DSE_ATTRS = {
     # confuses clients.
 }
 
-# ============================================================================
-# LdapAttr Jinja2 Template
-# ============================================================================
-# Inline Jinja2 template used by LdapAttr.to_xml(). Renders one LDAP
-# attribute as an XML fragment with its LdapSyntax annotation and one
-# <ad:value> element per value. The namespace prefix 'addata:' marks
-# this as a real LDAP attribute (vs. 'ad:' which is used for synthetic
-# attributes).
-# ============================================================================
+
+# ========================================================================== #
+# LdapAttr                                                                   #
+# ========================================================================== #
+# Wraps one LDAP attribute and its values, ready to be serialised into
+# the ADWS XML response format. LDAP_ATTR_TEMPLATE is the inline Jinja2
+# template used by LdapAttr.to_xml(). It renders the attribute with its
+# LdapSyntax annotation and one <ad:value> element per value. The
+# 'addata:' namespace prefix marks this as a real LDAP attribute (vs.
+# 'ad:' which is used for synthetic attributes).
+#
+# Bytes handling (LdapAttr.__init__):
+#   LDB returns all attribute values as bytes objects. We attempt UTF-8
+#   decode first (covers the vast majority of string attributes).
+#
+#   If the decoded string contains XML 1.0 illegal characters (e.g.
+#   \x01 SOH, which appears in some Samba group attributes), lxml will
+#   raise XMLSyntaxError when it tries to parse the rendered XML,
+#   crashing the connection handler before any response is sent. We
+#   detect this with XML_ILLEGAL_CHARS and base64-encode those values.
+#
+#   If UTF-8 decode fails entirely (SIDs, GUIDs, certificate blobs,
+#   nTSecurityDescriptor, etc.), we base64-encode the raw bytes. In
+#   both base64 cases xsi_type is updated to 'xsd:base64Binary' so
+#   Windows knows to decode the value on its end.
+
 LDAP_ATTR_TEMPLATE = jinja2.Template("""
 <addata:{{obj.attr}} LdapSyntax="{{obj.ldap_syntax}}">
    {%- for val in obj.vals %}
@@ -222,17 +281,6 @@ LDAP_ATTR_TEMPLATE = jinja2.Template("""
 
 
 class LdapAttr(object):
-    """
-    Represents one LDAP attribute retrieved from LDB, ready to be
-    serialised into the ADWS XML response format.
-
-    Handles the Python 3 bytes/str boundary: LDB returns attribute
-    values as bytes objects. We attempt UTF-8 decode first (covers the
-    vast majority of string attributes). If that fails (SIDs, GUIDs,
-    certificate blobs, etc.) we base64-encode the value and switch
-    xsi_type to 'xsd:base64Binary' so Windows knows to decode it on
-    the other end.
-    """
 
     def __init__(self, attr, vals, ldap_syntax, xsi_type='xsd:string'):
         # LDAP display name of the attribute, e.g. 'sAMAccountName'
@@ -243,8 +291,8 @@ class LdapAttr(object):
         assert ':' in xsi_type
         self.xsi_type = xsi_type
 
-        # ldb.MessageElement is a read-only C-level iterable. Convert to
-        # a plain Python list so we can index, modify, and iterate freely.
+        # ldb.MessageElement is a read-only C-level iterable. Convert
+        # to a plain Python list so we can index and modify freely.
         if hasattr(vals, '__iter__') and not isinstance(vals, (str, bytes)):
             self.vals = list(vals)
         else:
@@ -254,22 +302,27 @@ class LdapAttr(object):
         for i, v in enumerate(self.vals):
             if isinstance(v, bytes):
                 try:
-                    # Most LDAP string attributes are valid UTF-8.
-                    self.vals[i] = v.decode('utf-8')
+                    decoded = v.decode('utf-8')
+
+                    # Even valid UTF-8 may contain control characters
+                    # illegal in XML 1.0 (e.g. \x01 SOH). Detect them
+                    # with XML_ILLEGAL_CHARS and base64-encode if found.
+                    if XML_ILLEGAL_CHARS.search(decoded):
+                        self.vals[i] = b64encode(v).decode('ascii')
+                        self.xsi_type = 'xsd:base64Binary'
+                    else:
+                        self.vals[i] = decoded
+
                 except UnicodeDecodeError:
-                    # Binary attributes (objectSid, objectGUID,
-                    # nTSecurityDescriptor, userCertificate, etc.)
-                    # cannot be decoded as text. Base64-encode them so
-                    # they survive XML serialisation intact.
-                    # b64encode() returns bytes in Python 3; decode to
-                    # ASCII str so Jinja2 can render it without errors.
+                    # Truly binary data that cannot be decoded as UTF-8.
+                    # b64encode() returns bytes; decode to ASCII str so
+                    # Jinja2 can render it without type errors.
                     self.vals[i] = b64encode(v).decode('ascii')
 
                     # CRITICAL: update xsi_type so Windows knows to
                     # base64-decode this value. If left as 'xsd:string'
-                    # Windows interprets the base64 text as a literal
-                    # string value, causing attribute parsing failures
-                    # on the client side.
+                    # Windows interprets the base64 as literal text,
+                    # causing attribute parsing failures on the client.
                     self.xsi_type = 'xsd:base64Binary'
 
     def to_xml(self):
@@ -277,13 +330,12 @@ class LdapAttr(object):
         return LDAP_ATTR_TEMPLATE.render({'obj': self})
 
 
-
-# ============================================================================
-# Synthetic Attributes
-# ============================================================================
-# These attributes do not exist directly in the LDB schema but are
-# required by the ADWS protocol. They are computed by the proxy and
-# injected into responses. They use the 'ad:' namespace prefix rather
+# ========================================================================== #
+# SyntheticAttr                                                              #
+# ========================================================================== #
+# Wraps computed attributes that do not exist in LDB but are required
+# by the ADWS protocol. They are injected into responses by the render_*
+# methods of SamDBHelper. They use the 'ad:' namespace prefix rather
 # than 'addata:'.
 # Reference: https://msdn.microsoft.com/en-us/library/dd340577.aspx
 #
@@ -291,7 +343,11 @@ class LdapAttr(object):
 #   container-hierarchy-parent - GUID of the parent container
 #   distinguishedName          - Full LDAP DN string
 #   relativeDistinguishedName  - RDN component only (e.g. 'CN=MyPC')
-# ============================================================================
+#
+# The assertion in __init__ enforces that only known synthetic attribute
+# names are used, catching typos and protocol violations early rather
+# than producing silently malformed XML responses.
+
 SYNTHETIC_ATTRS = {
     'objectReferenceProperty',
     'container-hierarchy-parent',
@@ -309,14 +365,6 @@ SYNTHETIC_ATTR_TEMPLATE = jinja2.Template("""
 
 
 class SyntheticAttr(object):
-    """
-    Represents a computed/synthetic ADWS attribute that does not exist
-    in LDB.
-
-    The assertion enforces that only known synthetic attribute names are
-    used, catching typos and protocol violations early rather than
-    producing silently malformed XML responses.
-    """
 
     def __init__(self, attr, vals, xsi_type='xsd:string'):
         assert attr in SYNTHETIC_ATTRS, \
@@ -344,13 +392,37 @@ class SyntheticAttr(object):
 
 
 
+# ========================================================================== #
+# Helper Functions                                                           #
+# ========================================================================== #
+
+def render_template(template_name, **kwargs):
+    """
+    Load and render a Jinja2 template from the templates/ directory.
+
+    All keyword arguments are passed directly into the template context,
+    making them available as variables inside the XML template files.
+    """
+    template = ENV.get_template(template_name)
+    return template.render(**kwargs)
+
+
+
+def is_rootDSE(guid):
+    """
+    Return True if the given GUID string is the sentinel Root DSE GUID.
+    """
+    return guid.strip() == ROOT_DSE_GUID
+
+
+
 def get_rdn(dn):
     """
     Extract the Relative Distinguished Name from an ldb.Dn object.
 
-    For example, given the DN 'CN=MyComputer,OU=Servers,DC=corp,DC=local'
-    this returns the string 'CN=MyComputer'. Returns an empty string if
-    either component is missing (e.g. for the Root DSE which has no RDN).
+    For example, given 'CN=MyComputer,OU=Servers,DC=corp,DC=local' this
+    returns 'CN=MyComputer'. Returns an empty string if either component
+    is missing (e.g. for the Root DSE which has no RDN).
     """
     rdn_name  = dn.get_rdn_name()
     rdn_value = dn.get_rdn_value()
@@ -360,22 +432,20 @@ def get_rdn(dn):
 
 
 
-# ============================================================================
-# SamDBHelper
-# ============================================================================
+# ========================================================================== #
+# SamDBHelper                                                                #
+# ========================================================================== #
 # Subclasses SamDB (the Samba Python binding to the LDB directory
-# database) to add ADWS-specific query helpers and XML rendering
-# methods.
+# database) to add ADWS-specific query helpers and XML rendering methods.
 #
-# By subclassing rather than wrapping, we get direct access to all
-# SamDB methods (search, add, delete, modify, etc.) without delegation
-# boilerplate, while still being able to add our own methods alongside
-# them.
+# By subclassing rather than wrapping, we get direct access to all SamDB
+# methods (search, add, delete, modify, etc.) without delegation
+# boilerplate, while still being able to add our own methods alongside.
 #
 # SamDB connects to the local sam.ldb file using a system session
 # (root-level Kerberos credentials), which is why main.py must be run
 # as root/sudo.
-# ============================================================================
+
 class SamDBHelper(SamDB):
 
     def __init__(self):
@@ -388,26 +458,39 @@ class SamDBHelper(SamDB):
         # hashes, security descriptors, etc.).
         SamDB.__init__(self, lp=lp, session_info=system_session())
 
-    # ------------------------------------------------------------------------
-    # Convenience scope wrappers
-    # These are thin wrappers that inject the scope constant so call
-    # sites don't have to import or reference ldb.SCOPE_* directly.
-    # ------------------------------------------------------------------------
 
     def search_scope_base(self, *args, **kwargs):
-        """Search for exactly one object by DN (LDAP base scope)."""
+        """
+        Search for exactly one object by DN (LDAP base scope).
+
+        Thin wrapper that injects ldb.SCOPE_BASE so call sites do not
+        need to import or reference ldb.SCOPE_* directly.
+        """
         kwargs['scope'] = ldb.SCOPE_BASE
         return self.search(*args, **kwargs)
 
+
     def search_scope_onelevel(self, *args, **kwargs):
-        """Search immediate children of a container (one-level scope)."""
+        """
+        Search immediate children of a container (LDAP one-level scope).
+
+        Thin wrapper that injects ldb.SCOPE_ONELEVEL so call sites do
+        not need to import or reference ldb.SCOPE_* directly.
+        """
         kwargs['scope'] = ldb.SCOPE_ONELEVEL
         return self.search(*args, **kwargs)
 
+
     def search_scope_subtree(self, *args, **kwargs):
-        """Search a container and all descendants (subtree scope)."""
+        """
+        Search a container and all its descendants (LDAP subtree scope).
+
+        Thin wrapper that injects ldb.SCOPE_SUBTREE so call sites do
+        not need to import or reference ldb.SCOPE_* directly.
+        """
         kwargs['scope'] = ldb.SCOPE_SUBTREE
         return self.search(*args, **kwargs)
+
 
     def get_rootdse_attr_schema_syntax(self, attr):
         """
@@ -420,14 +503,15 @@ class SamDBHelper(SamDB):
         oid = ROOT_DSE_ATTRS.get(attr)
         return oid and OID_SCHEMA_SYNTAX_DICT.get(oid) or None
 
+
     def get_attr_schema_syntax(self, attr, is_root_dse=False):
         """
         Look up the SchemaSyntax for any attribute by LDAP display name.
 
-        For Root DSE attributes, falls back to the static ROOT_DSE_ATTRS
-        dict. For all other attributes, queries the live Samba schema via
-        get_syntax_oid_from_lDAPDisplayName() and looks up the result in
-        OID_SCHEMA_SYNTAX_DICT.
+        For Root DSE attributes, uses the static ROOT_DSE_ATTRS dict.
+        For all other attributes, queries the live Samba schema via
+        get_syntax_oid_from_lDAPDisplayName() and looks up the result
+        in OID_SCHEMA_SYNTAX_DICT.
 
         Returns None if the attribute is not found in either source,
         which triggers the fallback in build_attr_list().
@@ -437,6 +521,7 @@ class SamDBHelper(SamDB):
         else:
             oid = self.get_syntax_oid_from_lDAPDisplayName(attr)
         return oid and OID_SCHEMA_SYNTAX_DICT.get(oid) or None
+
 
     def build_attr_list(self, msg, is_root_dse=False, attr_names=[]):
         """
@@ -467,7 +552,7 @@ class SamDBHelper(SamDB):
         attrs = []
         for attr_name in attr_names:
             attr_obj = None
-            vals = msg.get(attr_name, None)
+            vals     = msg.get(attr_name, None)
 
             if vals is not None:
                 if attr_name in SYNTHETIC_ATTRS:
@@ -476,7 +561,7 @@ class SamDBHelper(SamDB):
                     attr_obj = SyntheticAttr(attr_name, vals)
                 else:
                     # Look up the LDAP syntax for this attribute so we
-                    # can annotate the XML with the correct type metadata.
+                    # can annotate the XML with the correct type info.
                     syntax = self.get_attr_schema_syntax(
                         attr_name, is_root_dse=is_root_dse)
 
@@ -496,9 +581,9 @@ class SamDBHelper(SamDB):
 
             else:
                 # The attribute was requested but not present on this
-                # object. The only synthetic attribute that can be
-                # computed from context when absent from msg is
-                # relativeDistinguishedName, derived from the object DN.
+                # object. relativeDistinguishedName is the only synthetic
+                # attribute that can be computed from context when absent
+                # -- it is derived from the object's DN.
                 if attr_name == 'relativeDistinguishedName':
                     attr_obj = SyntheticAttr(
                         attr_name, [get_rdn(msg['dn'])])
@@ -508,22 +593,16 @@ class SamDBHelper(SamDB):
 
         return attrs
 
-    # ========================================================================
-    # XML Rendering Methods
-    # Each method handles one ADWS SOAP action, performs the necessary
-    # LDB query, builds the attribute list, and delegates to a Jinja2
-    # template.
-    # ========================================================================
 
     def render_root_dse_xml(self, **context):
         """
         Handle a WS-Transfer Get request for the Root DSE.
 
         The Root DSE is queried with an empty base DN and SCOPE_BASE.
-        Three synthetic attributes are injected in a specific order
-        required by the ADWS protocol: objectReferenceProperty first,
-        then container-hierarchy-parent, relativeDistinguishedName, and
-        distinguishedName at the end.
+        Synthetic attributes are injected in the specific order required
+        by the ADWS protocol: objectReferenceProperty first, then
+        container-hierarchy-parent, relativeDistinguishedName, and
+        distinguishedName last.
         """
         result = self.search(base='', scope=ldb.SCOPE_BASE)
         msg    = result[0]
@@ -543,29 +622,31 @@ class SamDBHelper(SamDB):
         context['attrs'] = attrs
         return render_template('root-DSE.xml', **context)
 
+
     def render_msds_portldap(self, **context):
         """
         Handle a WS-Transfer Get request for msDS-PortLDAP.
 
         PowerShell queries this attribute early in the connection to
         discover which LDAP port the DC is listening on. We return a
-        static response from a template rather than querying LDB, since
+        static response from a template rather than querying LDB since
         the port is fixed.
         """
         return render_template('msDS-PortLDAP.xml', **context)
 
+
     def render_transfer_get(self, **context):
         """
-        Handle a WS-Transfer Get request for a specific AD object by GUID.
+        Handle a WS-Transfer Get for a specific AD object by GUID.
 
         The objectReferenceProperty in the request header contains the
-        GUID of the object to retrieve. We search LDB by GUID (Samba
-        accepts GUIDs as search base DNs in the format '<GUID=...>')
-        and return the requested attributes via transfer-Get.xml.
+        GUID of the object to retrieve. Samba accepts GUIDs as LDB
+        search base DNs in the format '<GUID=...>', so we pass it
+        directly to self.search().
         """
         AttributeType_List = context['AttributeType_List']
 
-        # Strip the namespace prefix from each attribute name.
+        # Strip namespace prefix from each attribute name.
         # e.g. 'addata:sAMAccountName' -> 'sAMAccountName'
         attr_names = [attr.split(':')[-1] for attr in AttributeType_List]
 
@@ -580,6 +661,7 @@ class SamDBHelper(SamDB):
         context['attrs'] = attrs
         return render_template('transfer-Get.xml', **context)
 
+
     def render_enumerate(self, **context):
         """
         Handle a WS-Enumeration Enumerate request.
@@ -588,52 +670,52 @@ class SamDBHelper(SamDB):
         an LDAP filter and attribute selection; we store them in a
         server-side context dict keyed by EnumerationContext UUID and
         return an acknowledgement. The actual LDB query happens in
-        render_pull() when the client sends a Pull request referencing
-        this EnumerationContext.
+        render_pull() when the client sends the matching Pull request.
         """
         return render_template('Enumerate.xml', **context)
+
 
     def render_pull(self, **context):
         """
         Handle a WS-Enumeration Pull request.
 
         This is the second half of the two-phase search started by
-        Enumerate. We execute the LDAP query stored in the
-        EnumerationContext, page the results using the LDB
-        paged_results control, and return the matching objects wrapped
-        in the correct object-class XML tags.
+        render_enumerate(). We execute the LDAP query stored in the
+        EnumerationContext, page the results using the LDB paged_results
+        control, and return the matching objects wrapped in the correct
+        object-class XML tags.
 
-        Generic object class fix (v1.1.0)
-        ----------------------------------
-        Previously the Pull.xml template hardcoded <addata:computer>
-        for every result object, which meant only Get-ADComputer worked
-        correctly.
+        Generic object class fix (v1.10)
+        ---------------------------------
+        Previously Pull.xml hardcoded <addata:computer> for every
+        result object, which meant only Get-ADComputer worked.
 
         The fix has two parts:
 
-        1. We always request objectClass from LDB in addition to
-           whatever attributes the client asked for. objectClass is
-           multi-valued; its last value is the most-derived class
-           (e.g. 'user', 'group', 'computer', 'organizationalUnit').
-           This is the value Windows uses as the XML element name in
-           ADWS responses.
+        1.  We always request objectClass from LDB in addition to
+            whatever attributes the client asked for. objectClass is
+            multi-valued; its last value is the most-derived class
+            (e.g. 'user', 'group', 'computer', 'organizationalUnit').
+            This is the value Windows uses as the XML element name in
+            ADWS responses.
 
-        2. We pass a list of (object_class, attrs) tuples to Pull.xml
-           instead of a flat list of attrs. The template uses the
-           object_class from each tuple to emit the correct
-           <addata:X> / </addata:X> tags, making the response valid
-           for any AD object type.
+        2.  We pass a list of (object_class, attrs) tuples to Pull.xml
+            instead of a flat list of attrs. The template uses the
+            object_class from each tuple to emit the correct
+            <addata:X> / </addata:X> tags, making the response valid
+            for any AD object type without per-type template files.
 
         If objectClass was not in the client's original attribute
-        request, we strip it from the rendered attr list so it does
-        not appear as a spurious attribute in the response payload.
+        request, we build the attr list using only attr_names so that
+        objectClass does not appear as a spurious attribute in the
+        response payload.
         """
         SelectionProperty_List = context['SelectionProperty_List']
         enumeration_context    = context['EnumerationContext']
         cookie                 = enumeration_context.get('cookie', '')
 
-        # Strip namespace prefixes from the attribute names the client
-        # wants. e.g. 'addata:sAMAccountName' -> 'sAMAccountName'
+        # Strip namespace prefix from attribute names the client wants.
+        # e.g. 'addata:sAMAccountName' -> 'sAMAccountName'
         attr_names = [attr.split(':')[-1] for attr in SelectionProperty_List]
 
         LdapQuery   = context['LdapQuery']
@@ -641,11 +723,10 @@ class SamDBHelper(SamDB):
 
         scope = SCOPE_ADLQ_TO_LDB[LdapQuery['Scope'].lower()]
 
-        # --- Generic object class fix, part 1 ---
         # Always include objectClass in the LDB query so we can
         # determine the correct XML wrapper tag for each result object.
-        # If the client did not ask for it we will strip it from the
-        # attribute list before rendering.
+        # Track whether the client asked for it so we can strip it from
+        # the rendered attr list if they did not.
         client_requested_objectclass = 'objectClass' in attr_names
         attrs_to_fetch = (
             attr_names
@@ -662,8 +743,8 @@ class SamDBHelper(SamDB):
         )
 
         # Check the paged_results control in the response to determine
-        # whether there are more pages. If the control is absent or the
-        # cookie is empty, this is the last (or only) page of results.
+        # whether more pages remain. If absent or the cookie is empty,
+        # this is the last (or only) page of results.
         ctrls = [
             str(c) for c in result.controls
             if str(c).startswith('paged_results')
@@ -672,32 +753,24 @@ class SamDBHelper(SamDB):
         if ctrls:
             spl = ctrls[0].rsplit(':', 3)
             if len(spl) == 3:
-                # A non-empty cookie means the server has more results.
-                # Store it so the next Pull request picks up where this
-                # one left off.
+                # Non-empty cookie -- more results waiting. Store it so
+                # the next Pull request picks up where this one left off.
                 new_cookie = ':' + spl[-1]
                 enumeration_context['cookie'] = new_cookie
                 context['is_end'] = False
             else:
-                # Cookie is empty -- this is the final page.
+                # Empty cookie -- this is the final page.
                 context['is_end'] = True
         else:
             # No paged_results control at all -- treat as final page.
             context['is_end'] = True
 
-        # --- Generic object class fix, part 2 ---
         # Build (object_class, attrs) tuples for every result object.
         #
         # objectClass is multi-valued and ordered from least- to
-        # most-derived. The last value is what we want: e.g. for a
-        # user object the values are ['top', 'person',
-        # 'organizationalPerson', 'user'] and we use 'user' as the
-        # XML element name to match Windows AD behaviour.
-        #
-        # If the client did not originally request objectClass, we
-        # build the attr list using only attr_names (excluding
-        # objectClass) so it does not appear as an extra attribute in
-        # the XML response.
+        # most-derived. The last value is what we want: e.g. for a user
+        # the list is ['top', 'person', 'organizationalPerson', 'user']
+        # and we use 'user' as the XML element name.
         objects = []
         for msg in result.msgs:
             object_class = (
@@ -706,13 +779,9 @@ class SamDBHelper(SamDB):
                 else 'top'  # safe fallback; should not occur in practice
             )
 
-            # Build the attribute list using only what the client asked
-            # for. objectClass is excluded here unless the client
-            # explicitly requested it, keeping the response clean.
-            attrs = self.build_attr_list(
-                msg,
-                attr_names=attr_names
-            )
+            # Build attr list using only what the client asked for.
+            # objectClass is excluded unless the client requested it.
+            attrs = self.build_attr_list(msg, attr_names=attr_names)
 
             objects.append((object_class, attrs))
 
@@ -721,13 +790,13 @@ class SamDBHelper(SamDB):
 
 
 
-# ============================================================================
-# Interactive Shell Entry Point
-# ============================================================================
+# ========================================================================== #
+# Interactive Shell Entry Point                                              #
+# ========================================================================== #
 # Running this file directly drops into an IPython shell with a live
 # SamDB connection, useful for inspecting LDB data and testing queries
 # interactively without going through the full ADWS proxy stack.
-# ============================================================================
+
 if __name__ == '__main__':
     from IPython import embed
     embed(header='Samba Python Shell')
