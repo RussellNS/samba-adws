@@ -1,0 +1,58 @@
+{# ======================================================================== #}
+{# Template : topology-action.xml                                           #}
+{# Purpose  : SOAP response for WS-CustomActions TopologyManagement         #}
+{#            requests (GetADDomain, GetADForest, GetADDomainController,    #}
+{#            and any other action routed through the TopologyManagement    #}
+{#            endpoint).                                                    #}
+{#                                                                          #}
+{# Background                                                               #}
+{# ----------                                                               #}
+{# PowerShell cmdlets like Get-ADDomain, Get-ADForest, and                  #}
+{# Get-ADDomainController open a separate connection to the                 #}
+{# TopologyManagement endpoint and send a CustomAction request              #}
+{# before retrieving actual data. The request body is empty -- it is        #}
+{# a capability handshake, not a data request. PowerShell uses the          #}
+{# response solely to confirm that the server speaks the                    #}
+{# TopologyManagement protocol. If the response is missing or               #}
+{# malformed, PowerShell throws ADServerDownException and aborts.           #}
+{#                                                                          #}
+{# After receiving a valid response here, PowerShell fetches the            #}
+{# actual domain/forest/DC data through the standard                        #}
+{# Enumerate/Pull path on its own, using LDAP filters such as               #}
+{#   (objectClass=domainDNS)                                                #}
+{#   (objectClass=crossRef)                                                 #}
+{# This template therefore contains no AD data -- it is a pure              #}
+{# protocol acknowledgement.                                                #}
+{#                                                                          #}
+{# Context variables supplied by render_topology_action() in                #}
+{# sambautils.py:                                                           #}
+{#   MessageID   - WS-Addressing MessageID from the request header.         #}
+{#                 Echoed in RelatesTo so PowerShell can correlate the      #}
+{#                 response to its request.                                 #}
+{#   action_name - The local name of the action, e.g. 'GetADDomain'.        #}
+{#                 Used to build the matching response element name         #}
+{#                 (e.g. <GetADDomainResponse>) and the Action URI.         #}
+{# ======================================================================== #}
+<s:Envelope
+        xmlns:a="http://www.w3.org/2005/08/addressing"
+        xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+    <s:Header>
+        {# Action URI follows the pattern:
+           ...CustomActions/TopologyManagement/<ActionName>Response #}
+        <a:Action s:mustUnderstand="1">http://schemas.microsoft.com/2008/1/ActiveDirectory/CustomActions/TopologyManagement/{{action_name}}Response</a:Action>
+
+        {# RelatesTo echoes the client's MessageID so PowerShell can
+           match this response to the handshake request it sent #}
+        <a:RelatesTo>{{MessageID}}</a:RelatesTo>
+    </s:Header>
+    <s:Body>
+        {# The response element name is the action name with 'Response'
+           appended, e.g. GetADDomainResponse, GetADForestResponse.
+           The body is intentionally empty -- PowerShell does not parse
+           any content from this response. It only checks that the
+           envelope is well-formed and the Action URI matches. #}
+        <{{action_name}}Response
+            xmlns="http://schemas.microsoft.com/2008/1/ActiveDirectory/CustomActions">
+        </{{action_name}}Response>
+    </s:Body>
+</s:Envelope>

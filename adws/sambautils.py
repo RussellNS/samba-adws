@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
 Script Modified:  2026-Jun-14
-Script Version:   1.1.1
+Script Version:   1.1.2
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -53,13 +53,19 @@ Change Log:
            bytes/binary handling, SamDB subclass pattern.
   1.1.0  - Generic object class fix. render_pull() now passes
            (object_class, attrs) tuples to Pull.xml so that any AD
-           object type (user, group, OU, etc.) is wrapped in the correct
-           <addata:X> tag instead of the hardcoded <addata:computer>.
-  1.1.1  - XML 1.0 illegal character fix. LdapAttr now detects control
-           characters (e.g. \x01) that are valid UTF-8 but illegal in
-           XML, and base64-encodes those values rather than letting lxml
-           raise XMLSyntaxError and crash the connection handler. This
-           fixes the Get-ADGroup failure observed in testing.
+           object type (user, group, OU, etc.) is wrapped in the
+           correct <addata:X> tag instead of <addata:computer>.
+           Fixes Get-ADUser, Get-ADGroup, Get-ADOU, Get-ADObject.
+  1.1.1  - XML 1.0 illegal character fix. LdapAttr now detects
+           control characters (e.g. \x01) that are valid UTF-8 but
+           illegal in XML, and base64-encodes those values rather
+           than letting lxml raise XMLSyntaxError and crash the
+           connection handler. Fixes Get-ADGroup failure.
+  1.1.2  - TopologyManagement support. Added render_topology_action()
+           to SamDBHelper and topology-action.xml template to handle
+           the WS-CustomActions capability handshake that Get-ADDomain,
+           Get-ADForest, and Get-ADDomainController send before
+           fetching data. Fixes ADServerDownException on those cmdlets.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -79,6 +85,7 @@ from os.path import abspath, dirname, join
 import jinja2
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from base64 import b64encode
+
 
 
 # ========================================================================== #
@@ -103,6 +110,7 @@ SYNTAX_GENERALIZED_TIME  = getattr(ldb, 'SYNTAX_GENERALIZED_TIME',  1)
 SYNTAX_OBJECT_IDENTIFIER = getattr(ldb, 'SYNTAX_OBJECT_IDENTIFIER', 1)
 
 
+
 # ========================================================================== #
 # XML 1.0 Illegal Character Pattern                                          #
 # ========================================================================== #
@@ -125,6 +133,7 @@ XML_ILLEGAL_CHARS = re.compile(
 )
 
 
+
 # ========================================================================== #
 # Jinja2 Template Engine Setup                                               #
 # ========================================================================== #
@@ -144,6 +153,7 @@ ENV = Environment(
 )
 
 
+
 # ========================================================================== #
 # LDAP Scope Mapping                                                         #
 # ========================================================================== #
@@ -159,6 +169,7 @@ SCOPE_ADLQ_TO_LDB = {
 }
 
 
+
 # ========================================================================== #
 # Root DSE Sentinel GUID                                                     #
 # ========================================================================== #
@@ -169,6 +180,7 @@ SCOPE_ADLQ_TO_LDB = {
 # object.
 
 ROOT_DSE_GUID = '11111111-1111-1111-1111-111111111111'
+
 
 
 # ========================================================================== #
@@ -202,6 +214,7 @@ class SchemaSyntax(object):
 
     def render(self):
         return 'xml'
+
 
 
 SCHEMA_SYNTAX_LIST = [
@@ -244,6 +257,7 @@ ROOT_DSE_ATTRS = {
     # responses because it is not part of the Windows AD schema and
     # confuses clients.
 }
+
 
 
 # ========================================================================== #
@@ -328,6 +342,7 @@ class LdapAttr(object):
     def to_xml(self):
         """Render this attribute as an XML fragment string."""
         return LDAP_ATTR_TEMPLATE.render({'obj': self})
+
 
 
 # ========================================================================== #
@@ -787,6 +802,40 @@ class SamDBHelper(SamDB):
 
         context['objects'] = objects
         return render_template('Pull.xml', **context)
+
+
+    def render_topology_action(self, **context):
+        """
+        Handle a WS-CustomActions TopologyManagement request.
+
+        PowerShell cmdlets Get-ADDomain, Get-ADForest, and
+        Get-ADDomainController open a connection to the separate
+        TopologyManagement endpoint and send a CustomAction request
+        before retrieving any data. The request body is always empty
+        -- it is a capability handshake, not a data request.
+
+        PowerShell uses the response only to confirm the server speaks
+        the TopologyManagement protocol. If the response is missing or
+        malformed it raises ADServerDownException and aborts. After
+        receiving a valid acknowledgement here, PowerShell fetches the
+        actual data through the standard Enumerate/Pull path using its
+        own LDAP filters (e.g. objectClass=domainDNS).
+
+        The Action URI follows the pattern:
+          .../CustomActions/TopologyManagement/<ActionName>
+
+        We extract the local action name (e.g. 'GetADDomain') from the
+        tail of the URI and pass it to the template, which uses it to
+        build the matching response element and Action URI.
+        """
+        action = context.get('Action', '')
+
+        # Extract the local action name from the tail of the URI.
+        # e.g. '.../TopologyManagement/GetADDomain' -> 'GetADDomain'
+        action_name = action.split('/')[-1] if action else 'Unknown'
+
+        context['action_name'] = action_name
+        return render_template('topology-action.xml', **context)
 
 
 
