@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
 Script Modified:  2026-Jun-14
-Script Version:   1.1.3
+Script Version:   1.1.4
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -75,6 +75,13 @@ Change Log:
            empty attr_names list to build_attr_list() so all returned
            attributes are rendered in the response. Fixes Get-ADDomain,
            Get-ADForest, and Get-ADDomainController data population.
+  1.1.4  - Empty BaseObject fix. Get-ADDomainController sends an empty
+           string as the LDAP BaseObject, intending a global subtree
+           search of the entire directory. Samba's LDB partition module
+           rejects an empty base DN with error 32. render_pull() now
+           falls back to self.domain_dn() when BaseObject is empty,
+           matching real Windows DC behaviour. Fixes the LdbError crash
+           on Get-ADDomainController.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -765,8 +772,15 @@ class SamDBHelper(SamDB):
                 else attr_names + ['objectClass']
             )
 
+        # An empty BaseObject means 'search the entire directory'.
+        # Samba's LDB partition module rejects an empty base DN with
+        # error 32. Fall back to the domain DN, which is the correct
+        # default search base for a global subtree search and matches
+        # what a real Windows DC uses in this scenario.
+        base = LdapQuery['BaseObject'] or str(self.domain_dn())
+
         result = self.search(
-            base=LdapQuery['BaseObject'],
+            base=base,
             scope=scope,
             expression=LdapQuery['Filter'],
             attrs=attrs_to_fetch,
