@@ -1,31 +1,102 @@
+{# ======================================================================== #}
+{# Template : Pull.xml                                                      #}
+{# Purpose  : SOAP response for a WS-Enumeration Pull request.              #}
+{#                                                                          #}
+{# A Pull request is the second half of a two-phase AD search. The          #}
+{# client first sends an Enumerate request (which stores the LDAP           #}
+{# filter and attribute selection on the server). It then sends one         #}
+{# or more Pull requests to page through the results.                       #}
+{#                                                                          #}
+{# Context variables supplied by render_pull() in sambautils.py:            #}
+{#                                                                          #}
+{#   MessageID                                                              #}
+{#     The WS-Addressing MessageID from the request header. Echoed          #}
+{#     back in RelatesTo so the client can correlate this response          #}
+{#     to the Pull request that triggered it.                               #}
+{#                                                                          #}
+{#   objects                                                                #}
+{#     List of (object_class, attrs) tuples. Each tuple is one AD           #}
+{#     object from the LDB search result:                                   #}
+{#       object_class : Most-derived objectClass value from LDB             #}
+{#                      (e.g. 'user', 'group', 'computer',                  #}
+{#                      'organizationalUnit'). Used as the XML              #}
+{#                      element name so Windows sees the correct            #}
+{#                      object type in the response.                        #}
+{#       attrs        : List of LdapAttr / SyntheticAttr objects            #}
+{#                      whose .to_xml() method renders each                 #}
+{#                      attribute as an XML fragment.                       #}
+{#                                                                          #}
+{#   is_end                                                                 #}
+{#     Boolean. True when this is the last (or only) page of results.       #}
+{#     Controls whether wsen:EndOfSequence is emitted. False means          #}
+{#     the client should send another Pull request with the same            #}
+{#     EnumerationContext to retrieve the next page.                        #}
+{#                                                                          #}
+{# Generic object class fix (v1.1.0)                                        #}
+{# -----------------------------------                                      #}
+{# Previously this template hardcoded <addata:computer> for every           #}
+{# object, which caused all non-computer searches (Get-ADUser,              #}
+{# Get-ADGroup, etc.) to return incorrectly typed responses that            #}
+{# Windows would reject or misinterpret. The fix unpacks object_class       #}
+{# from each tuple and uses it as the dynamic XML element name,             #}
+{# making this template work correctly for any AD object type without       #}
+{# requiring per-type template files.                                       #}
+{# ======================================================================== #}
 <s:Envelope
-        xmlns:a="http://www.w3.org/2005/08/addressing" 
+        xmlns:a="http://www.w3.org/2005/08/addressing"
         xmlns:s="http://www.w3.org/2003/05/soap-envelope">
         <s:Header>
+            {# WS-Addressing Action URI identifying this as a PullResponse #}
             <a:Action s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2004/09/enumeration/PullResponse</a:Action>
+
+            {# RelatesTo echoes the client's MessageID so it can match
+               this response to the Pull request that triggered it #}
             <a:RelatesTo>{{MessageID}}</a:RelatesTo>
         </s:Header>
         <s:Body>
             <wsen:PullResponse
-                xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
-                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
-                xmlns:addata="http://schemas.microsoft.com/2008/1/ActiveDirectory/Data" 
-                xmlns:ad="http://schemas.microsoft.com/2008/1/ActiveDirectory" 
+                xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xmlns:addata="http://schemas.microsoft.com/2008/1/ActiveDirectory/Data"
+                xmlns:ad="http://schemas.microsoft.com/2008/1/ActiveDirectory"
                 xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+
                 <wsen:Items>
-                    {% for object in objects %}
-                    <addata:computer>
-                    {% for attr in object %}
-                    {{attr.to_xml()|safe}}
-                    {% endfor %}
-                    </addata:computer>
+                    {# Iterate over the (object_class, attrs) tuples built
+                       by render_pull(). Each iteration is one AD object. #}
+                    {% for object_class, attrs in objects %}
+
+                    {# The opening tag uses the most-derived objectClass
+                       value from LDB (e.g. 'user', 'group', 'computer',
+                       'organizationalUnit'). This matches what Windows AD
+                       returns for real DCs and what PowerShell expects.
+                       Previously hardcoded as <addata:computer>. #}
+                    <addata:{{object_class}}>
+
+                        {# Render each attribute as an XML fragment.
+                           |safe bypasses Jinja2 auto-escaping because
+                           attr.to_xml() already produces well-formed XML
+                           using its own template in sambautils.py. #}
+                        {% for attr in attrs %}
+                        {{attr.to_xml()|safe}}
+                        {% endfor %}
+
+                    {# Closing tag matches the dynamic opening tag above #}
+                    </addata:{{object_class}}>
+
                     {% endfor %}
                 </wsen:Items>
+
+                {# EndOfSequence signals no more pages remain. When
+                   is_end is False the client must send another Pull
+                   request with the same EnumerationContext UUID to
+                   retrieve the next page of results. #}
                 {% if is_end %}
                 <wsen:EndOfSequence
                     xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
                 </wsen:EndOfSequence>
                 {% endif %}
+
             </wsen:PullResponse>
         </s:Body>
     </s:Envelope>
