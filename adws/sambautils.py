@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
 Script Modified:  2026-Jun-14
-Script Version:   1.1.4
+Script Version:   1.1.5
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -82,6 +82,15 @@ Change Log:
            falls back to self.domain_dn() when BaseObject is empty,
            matching real Windows DC behaviour. Fixes the LdbError crash
            on Get-ADDomainController.
+  1.1.5  - GetADDomainController data response. Unlike GetADDomain and
+           GetADForest, the GetADDomainController topology action is a
+           data request, not a handshake. The request body contains an
+           NtdsSettingsDN identifying the DC to look up. Added
+           render_get_dc() to SamDBHelper which queries the nTDSDSA
+           and server objects from LDB and renders the full DC property
+           set into GetADDomainController.xml. render_topology_action()
+           now dispatches to render_get_dc() for this action instead
+           of returning an empty acknowledgement.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -89,8 +98,6 @@ To Do List:
   *  Implement MS-ADCAP custom operations (password change, unlock, etc.).
 ------------------------------------------------------------------------------
 """
-
-
 from __future__ import print_function, absolute_import
 import ldb
 import re
@@ -103,6 +110,7 @@ from os.path import abspath, dirname, join
 import jinja2
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from base64 import b64encode
+
 
 
 # ========================================================================== #
@@ -127,6 +135,7 @@ SYNTAX_GENERALIZED_TIME  = getattr(ldb, 'SYNTAX_GENERALIZED_TIME',  1)
 SYNTAX_OBJECT_IDENTIFIER = getattr(ldb, 'SYNTAX_OBJECT_IDENTIFIER', 1)
 
 
+
 # ========================================================================== #
 # XML 1.0 Illegal Character Pattern                                          #
 # ========================================================================== #
@@ -149,6 +158,7 @@ XML_ILLEGAL_CHARS = re.compile(
 )
 
 
+
 # ========================================================================== #
 # Jinja2 Template Engine Setup                                               #
 # ========================================================================== #
@@ -168,6 +178,7 @@ ENV = Environment(
 )
 
 
+
 # ========================================================================== #
 # LDAP Scope Mapping                                                         #
 # ========================================================================== #
@@ -183,6 +194,7 @@ SCOPE_ADLQ_TO_LDB = {
 }
 
 
+
 # ========================================================================== #
 # Root DSE Sentinel GUID                                                     #
 # ========================================================================== #
@@ -193,6 +205,7 @@ SCOPE_ADLQ_TO_LDB = {
 # object.
 
 ROOT_DSE_GUID = '11111111-1111-1111-1111-111111111111'
+
 
 
 # ========================================================================== #
@@ -226,6 +239,7 @@ class SchemaSyntax(object):
 
     def render(self):
         return 'xml'
+
 
 
 SCHEMA_SYNTAX_LIST = [
@@ -270,6 +284,7 @@ ROOT_DSE_ATTRS = {
 }
 
 
+
 # ========================================================================== #
 # LdapAttr                                                                   #
 # ========================================================================== #
@@ -301,6 +316,7 @@ LDAP_ATTR_TEMPLATE = jinja2.Template("""
    <ad:value xsi:type="{{obj.xsi_type}}">{{val}}</ad:value>
    {%- endfor %}
 </addata:{{obj.attr}}>""".strip())
+
 
 
 class LdapAttr(object):
@@ -353,6 +369,7 @@ class LdapAttr(object):
         return LDAP_ATTR_TEMPLATE.render({'obj': self})
 
 
+
 # ========================================================================== #
 # SyntheticAttr                                                              #
 # ========================================================================== #
@@ -386,6 +403,7 @@ SYNTHETIC_ATTR_TEMPLATE = jinja2.Template("""
 </ad:{{obj.attr}}>""".strip())
 
 
+
 class SyntheticAttr(object):
 
     def __init__(self, attr, vals, xsi_type='xsd:string'):
@@ -411,6 +429,7 @@ class SyntheticAttr(object):
     def to_xml(self):
         """Render this synthetic attribute as an XML fragment string."""
         return SYNTHETIC_ATTR_TEMPLATE.render({'obj': self})
+
 
 
 # ========================================================================== #
@@ -448,6 +467,7 @@ def get_rdn(dn):
     if rdn_name and rdn_value:
         return '%s=%s' % (rdn_name, rdn_value)
     return ''
+
 
 
 # ========================================================================== #
@@ -840,29 +860,216 @@ class SamDBHelper(SamDB):
         return render_template('Pull.xml', **context)
 
 
+    def render_get_dc(self, **context):
+        """
+        Handle the GetADDomainController TopologyManagement action.
+
+        Unlike GetADDomain and GetADForest (which are pure handshakes
+        with empty request bodies), GetADDomainController is a DATA
+        request. The request body contains an NtdsSettingsDN element
+        identifying which DC to look up. PowerShell uses the response
+        body to construct the ADDomainController object directly and
+        does not make a follow-up Enumerate/Pull.
+
+        We query two LDB objects to build the response:
+          1. The nTDSDSA object (NtdsSettingsDN from the request) for
+             invocationId, hasMasterNCs, msDS-Behavior-Version, and
+             options (bit 0 set = Global Catalog).
+          2. The server object (parent DN of the nTDSDSA) for
+             dNSHostName, serverReference, and objectGUID.
+
+        FSMO role ownership is determined by comparing the
+        fSMORoleOwner attributes of well-known objects against the
+        NtdsSettingsDN. The five standard FSMO roles checked are:
+          - PDC Emulator     (domainDNS object)
+          - RID Master       (RID Manager$ object)
+          - Infrastructure   (Infrastructure object)
+          - Schema Master    (schema NC head)
+          - Domain Naming    (partitions container)
+        """
+        xmlhelper = context['xmlhelper']
+
+        # Extract NtdsSettingsDN from the request body.
+        # Namespace: b = serialization arrays namespace used by ADWS.
+        ntds_dn = xmlhelper.get_elem_text(
+            './/s:Body//b:string',
+        )
+        if not ntds_dn:
+            # Fall back to generic handshake if DN is missing
+            context['action_name'] = 'GetADDomainController'
+            return render_template('topology-action.xml', **context)
+
+        # Query the nTDSDSA object
+        ntds_result = self.search(
+            base=ntds_dn,
+            scope=ldb.SCOPE_BASE,
+            expression='(objectClass=*)',
+            attrs=['invocationId', 'hasMasterNCs', 'options',
+                   'objectGUID', 'msDS-Behavior-Version']
+        )
+        ntds_msg = ntds_result[0]
+
+        # The server object is the direct parent of the nTDSDSA object.
+        # Strip the first component of the DN to get the parent.
+        # e.g. 'CN=NTDS Settings,CN=DC1,...' -> 'CN=DC1,...'
+        server_dn = ','.join(ntds_dn.split(',')[1:])
+
+        server_result = self.search(
+            base=server_dn,
+            scope=ldb.SCOPE_BASE,
+            expression='(objectClass=*)',
+            attrs=['dNSHostName', 'serverReference',
+                   'objectGUID', 'cn']
+        )
+        server_msg = server_result[0]
+
+        # Extract site name from the server DN.
+        # DN structure: CN=<dc>,CN=Servers,CN=<site>,CN=Sites,...
+        # Split gives: ['CN=<dc>', 'CN=Servers', 'CN=<site>', ...]
+        dn_parts   = server_dn.split(',')
+        if len(dn_parts) > 2:
+            site_name = dn_parts[2].split('=')[1]
+        else:
+            site_name = ''
+
+        # Build the list of NC partitions mastered by this DC
+        partitions = []
+        if 'hasMasterNCs' in ntds_msg:
+            partitions = [
+                str(v) for v in ntds_msg['hasMasterNCs']
+            ]
+
+        # Determine Global Catalog status.
+        # options bit 0 (value 1) set means this is a GC.
+        if 'options' in ntds_msg:
+            options = int(str(ntds_msg['options'][0]))
+        else:
+            options = 0
+        is_gc = 'true' if (options & 1) else 'false'
+
+        # Resolve FSMO roles held by this DC by comparing the
+        # fSMORoleOwner attribute of each role object against
+        # ntds_dn (case-insensitive).
+        fsmo_checks = {
+            'PDCEmulator':       self.domain_dn(),
+            'RIDMaster':         'CN=RID Manager$,CN=System,'
+                                 + str(self.domain_dn()),
+            'InfrastructureMaster': 'CN=Infrastructure,'
+                                    + str(self.domain_dn()),
+            'SchemaMaster':      str(self.get_schema_basedn()),
+            'DomainNamingMaster':'CN=Partitions,CN=Configuration,'
+                                 + str(self.domain_dn()),
+        }
+        roles = []
+        for role_name, role_base in fsmo_checks.items():
+            try:
+                r = self.search(
+                    base=role_base,
+                    scope=ldb.SCOPE_BASE,
+                    expression='(objectClass=*)',
+                    attrs=['fSMORoleOwner']
+                )
+                if r and 'fSMORoleOwner' in r[0]:
+                    owner = str(r[0]['fSMORoleOwner'][0])
+                    if owner.lower() == ntds_dn.lower():
+                        roles.append(role_name)
+            except Exception:
+                pass
+
+        # Resolve domain DNS name from the default naming context.
+        # e.g. DC=vlab,DC=test -> vlab.test
+        domain_dn  = str(self.domain_dn())
+        domain_dns = '.'.join(
+            p.split('=')[1]
+            for p in domain_dn.split(',')
+            if p.upper().startswith('DC=')
+        )
+
+        # objectGUID from server object - decode bytes to GUID string
+        if 'objectGUID' in server_msg:
+            server_guid_raw = bytes(server_msg['objectGUID'][0])
+        else:
+            server_guid_raw = b''
+        if len(server_guid_raw) == 16:
+            import struct
+            p = struct.unpack('<IHH8B', server_guid_raw)
+            server_guid = (
+                '%08x-%04x-%04x-%02x%02x-'
+                '%02x%02x%02x%02x%02x%02x'
+            ) % (p[0], p[1], p[2], p[3], p[4],
+                 p[5], p[6], p[7], p[8], p[9], p[10])
+        else:
+            server_guid = ''
+
+        # invocationId is stored as a raw GUID bytes value
+        if 'invocationId' in ntds_msg:
+            inv_raw = bytes(ntds_msg['invocationId'][0])
+        else:
+            inv_raw = b''
+        if len(inv_raw) == 16:
+            inv_id = (
+                '%08x-%04x-%04x-%02x%02x-'
+                '%02x%02x%02x%02x%02x%02x'
+            ) % (p[0], p[1], p[2], p[3], p[4],
+                 p[5], p[6], p[7], p[8], p[9], p[10])
+            import struct
+            p2 = struct.unpack('<IHH8B', inv_raw)
+            inv_id = (
+                '%08x-%04x-%04x-%02x%02x-'
+                '%02x%02x%02x%02x%02x%02x'
+            ) % (p2[0], p2[1], p2[2], p2[3], p2[4],
+                 p2[5], p2[6], p2[7], p2[8], p2[9], p2[10])
+        else:
+            inv_id = ''
+
+        context.update({
+            'NtdsSettingsDN':   ntds_dn,
+            'ServerObjectDN':   server_dn,
+            'ServerObjectGuid': server_guid,
+            'ComputerObjectDN': str(server_msg['serverReference'][0])
+                                if 'serverReference' in server_msg
+                                else '',
+            'HostName':         str(server_msg['dNSHostName'][0])
+                                if 'dNSHostName' in server_msg else '',
+            'Name':             str(server_msg['cn'][0])
+                                if 'cn' in server_msg else '',
+            'Site':             site_name,
+            'Domain':           domain_dns,
+            'Forest':           domain_dns,
+            'DefaultPartition': domain_dn,
+            'Partitions':       partitions,
+            'InvocationId':     inv_id,
+            'IsGlobalCatalog':  is_gc,
+            'IsReadOnly':       'false',
+            'LdapPort':         '389',
+            'SslPort':          '636',
+            'Enabled':          'true',
+            'OperationMasterRoles': roles,
+        })
+        return render_template('GetADDomainController.xml', **context)
+
+
     def render_topology_action(self, **context):
         """
         Handle a WS-CustomActions TopologyManagement request.
 
-        PowerShell cmdlets Get-ADDomain, Get-ADForest, and
-        Get-ADDomainController open a connection to the separate
-        TopologyManagement endpoint and send a CustomAction request
-        before retrieving any data. The request body is always empty
-        -- it is a capability handshake, not a data request.
+        Most topology actions (GetADDomain, GetADForest) are pure
+        capability handshakes -- the request body is empty and
+        PowerShell only checks that the response is well-formed before
+        going on to fetch data via Enumerate/Pull.
 
-        PowerShell uses the response only to confirm the server speaks
-        the TopologyManagement protocol. If the response is missing or
-        malformed it raises ADServerDownException and aborts. After
-        receiving a valid acknowledgement here, PowerShell fetches the
-        actual data through the standard Enumerate/Pull path using its
-        own LDAP filters (e.g. objectClass=domainDNS).
+        GetADDomainController is the exception: its request body
+        contains an NtdsSettingsDN and PowerShell constructs the
+        ADDomainController object directly from the response body
+        without a follow-up Enumerate/Pull. It is dispatched to
+        render_get_dc() which performs the necessary LDB queries.
 
         The Action URI follows the pattern:
           .../CustomActions/TopologyManagement/<ActionName>
 
-        We extract the local action name (e.g. 'GetADDomain') from the
-        tail of the URI and pass it to the template, which uses it to
-        build the matching response element and Action URI.
+        We extract the local action name (e.g. 'GetADDomain') from
+        the tail of the URI. Handshake actions use topology-action.xml
+        (empty body). Data actions use their own dedicated template.
         """
         action = context.get('Action', '')
 
@@ -870,8 +1077,14 @@ class SamDBHelper(SamDB):
         # e.g. '.../TopologyManagement/GetADDomain' -> 'GetADDomain'
         action_name = action.split('/')[-1] if action else 'Unknown'
 
+        # Dispatch data actions to their dedicated render methods.
+        if action_name == 'GetADDomainController':
+            return self.render_get_dc(**context)
+
+        # All other topology actions are pure handshakes.
         context['action_name'] = action_name
         return render_template('topology-action.xml', **context)
+
 
 
 # ========================================================================== #

@@ -199,6 +199,7 @@ class NETTCPProxy(SocketServer.BaseRequestHandler):
                     'Action': xmlhelper.get_elem_text('.//a:Action'),
                     'To': xmlhelper.get_elem_text('.//a:To'),
                     'AttributeType_List': AttributeType_List,
+                    'xmlhelper': xmlhelper,   # pass through for topology data actions
                 }
 
                 ack_xml = None

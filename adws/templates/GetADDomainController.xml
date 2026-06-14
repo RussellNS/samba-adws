@@ -1,0 +1,79 @@
+{# ======================================================================== #}
+{# Template : GetADDomainController.xml                                     #}
+{# Purpose  : SOAP response for the TopologyManagement                      #}
+{#            GetADDomainController CustomAction.                           #}
+{#                                                                          #}
+{# Unlike GetADDomain and GetADForest, this is a DATA request not a         #}
+{# handshake. The request body contains an NtdsSettingsDN element           #}
+{# identifying which DC to look up. PowerShell uses the response body       #}
+{# to construct the ADDomainController object directly -- it does not       #}
+{# make a follow-up Enumerate/Pull. The response must contain all           #}
+{# fields that PowerShell expects or it raises ADIdentityNotFoundException. #}
+{#                                                                          #}
+{# Context variables supplied by render_get_dc() in sambautils.py:          #}
+{#   MessageID        - WS-Addressing MessageID from the request header.    #}
+{#   NtdsSettingsDN   - DN of the nTDSDSA object (from request body).       #}
+{#   ServerObjectDN   - DN of the server object (parent of nTDSDSA).        #}
+{#   ServerObjectGuid - objectGUID of the server object.                    #}
+{#   ComputerObjectDN - DN of the computer object in the domain NC.         #}
+{#   HostName         - dNSHostName of the DC.                              #}
+{#   Name             - Short name of the DC (cn of server object).         #}
+{#   Site             - Site name (cn of the site container).               #}
+{#   Domain           - DNS domain name (e.g. vlab.test).                   #}
+{#   Forest           - DNS forest name (same as Domain in single-domain).  #}
+{#   DefaultPartition - Default naming context DN.                          #}
+{#   Partitions       - List of NC DNs mastered by this DC.                 #}
+{#   InvocationId     - invocationId GUID from the nTDSDSA object.          #}
+{#   IsGlobalCatalog  - 'true' or 'false' string.                           #}
+{#   IsReadOnly       - 'false' (RWDC).                                     #}
+{#   LdapPort         - LDAP port string (always '389').                    #}
+{#   SslPort          - LDAPS port string (always '636').                   #}
+{#   Enabled          - 'true' (DC computer accounts are always enabled).   #}
+{#   OperationMasterRoles - list of FSMO role name strings held by this DC. #}
+{# ======================================================================== #}
+<s:Envelope
+        xmlns:a="http://www.w3.org/2005/08/addressing"
+        xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+    <s:Header>
+        <a:Action s:mustUnderstand="1">http://schemas.microsoft.com/2008/1/ActiveDirectory/CustomActions/TopologyManagement/GetADDomainControllerResponse</a:Action>
+        <a:RelatesTo>{{MessageID}}</a:RelatesTo>
+    </s:Header>
+    <s:Body>
+        <GetADDomainControllerResponse
+                xmlns="http://schemas.microsoft.com/2008/1/ActiveDirectory/CustomActions"
+                xmlns:b="http://schemas.microsoft.com/2003/10/Serialization/Arrays"
+                xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+            <ComputerObjectDN>{{ComputerObjectDN}}</ComputerObjectDN>
+            <DefaultPartition>{{DefaultPartition}}</DefaultPartition>
+            <Domain>{{Domain}}</Domain>
+            <Enabled>{{Enabled}}</Enabled>
+            <Forest>{{Forest}}</Forest>
+            <HostName>{{HostName}}</HostName>
+            <InvocationId>{{InvocationId}}</InvocationId>
+            <IPv4Address i:nil="true"/>
+            <IsGlobalCatalog>{{IsGlobalCatalog}}</IsGlobalCatalog>
+            <IsReadOnly>{{IsReadOnly}}</IsReadOnly>
+            <LdapPort>{{LdapPort}}</LdapPort>
+            <Name>{{Name}}</Name>
+            <NTDSSettingsDN>{{NtdsSettingsDN}}</NTDSSettingsDN>
+            <OperatingSystem i:nil="true"/>
+            <OperatingSystemHotfix i:nil="true"/>
+            <OperatingSystemServicePack i:nil="true"/>
+            <OperatingSystemVersion i:nil="true"/>
+            <OperationMasterRoles>
+                {% for role in OperationMasterRoles %}
+                <b:string>{{role}}</b:string>
+                {% endfor %}
+            </OperationMasterRoles>
+            <Partitions>
+                {% for partition in Partitions %}
+                <b:string>{{partition}}</b:string>
+                {% endfor %}
+            </Partitions>
+            <ServerObjectDN>{{ServerObjectDN}}</ServerObjectDN>
+            <ServerObjectGuid>{{ServerObjectGuid}}</ServerObjectGuid>
+            <Site>{{Site}}</Site>
+            <SslPort>{{SslPort}}</SslPort>
+        </GetADDomainControllerResponse>
+    </s:Body>
+</s:Envelope>

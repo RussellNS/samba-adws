@@ -5,15 +5,16 @@ import re
 from lxml import etree
 
 NAMESPACES = {
-    "s": "http://www.w3.org/2003/05/soap-envelope",
     "a": "http://www.w3.org/2005/08/addressing",
-    "addata": "http://schemas.microsoft.com/2008/1/ActiveDirectory/Data",
     "ad": "http://schemas.microsoft.com/2008/1/ActiveDirectory",
+    "addata": "http://schemas.microsoft.com/2008/1/ActiveDirectory/Data",
+    "adlq": "http://schemas.microsoft.com/2008/1/ActiveDirectory/Dialect/LdapQuery",
+    "b": "http://schemas.microsoft.com/2003/10/Serialization/Arrays",
     "da": "http://schemas.microsoft.com/2006/11/IdentityManagement/DirectoryAccess",
+    "s": "http://www.w3.org/2003/05/soap-envelope",
+    "wsen": "http://schemas.xmlsoap.org/ws/2004/09/enumeration",
     "xsd": "http://www.w3.org/2001/XMLSchema",
     "xsi": "http://www.w3.org/2001/XMLSchema-instance",
-    "adlq": "http://schemas.microsoft.com/2008/1/ActiveDirectory/Dialect/LdapQuery",
-    "wsen": "http://schemas.xmlsoap.org/ws/2004/09/enumeration",
 }
 
 
