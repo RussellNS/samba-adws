@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
 Script Modified:  2026-Jun-14
-Script Version:   1.1.7
+Script Version:   1.1.8
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -106,6 +106,13 @@ Change Log:
            and Configuration NC separately when BaseObject is empty
            and merges the results, matching the global directory
            search a real Windows DC performs.
+  1.1.8  - Fix ldb.Result.msgs read-only error. v1.1.7 attempted to
+           assign to last_result.msgs to carry merged results through
+           the existing loop, but ldb.Result.msgs is a read-only C
+           attribute. The multi-NC branch now builds the objects list
+           directly from all_msgs without using a carrier result
+           object, bypassing the paged_results control path entirely
+           (multi-NC results are small and do not need paging).
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -113,8 +120,6 @@ To Do List:
   *  Implement MS-ADCAP custom operations (password change, unlock, etc.).
 ------------------------------------------------------------------------------
 """
-
-
 from __future__ import print_function, absolute_import
 import ldb
 import re
@@ -127,6 +132,7 @@ from os.path import abspath, dirname, join
 import jinja2
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from base64 import b64encode
+
 
 
 # ========================================================================== #
@@ -151,6 +157,7 @@ SYNTAX_GENERALIZED_TIME  = getattr(ldb, 'SYNTAX_GENERALIZED_TIME',  1)
 SYNTAX_OBJECT_IDENTIFIER = getattr(ldb, 'SYNTAX_OBJECT_IDENTIFIER', 1)
 
 
+
 # ========================================================================== #
 # XML 1.0 Illegal Character Pattern                                          #
 # ========================================================================== #
@@ -173,6 +180,7 @@ XML_ILLEGAL_CHARS = re.compile(
 )
 
 
+
 # ========================================================================== #
 # Jinja2 Template Engine Setup                                               #
 # ========================================================================== #
@@ -192,6 +200,7 @@ ENV = Environment(
 )
 
 
+
 # ========================================================================== #
 # LDAP Scope Mapping                                                         #
 # ========================================================================== #
@@ -207,6 +216,7 @@ SCOPE_ADLQ_TO_LDB = {
 }
 
 
+
 # ========================================================================== #
 # Root DSE Sentinel GUID                                                     #
 # ========================================================================== #
@@ -217,6 +227,7 @@ SCOPE_ADLQ_TO_LDB = {
 # object.
 
 ROOT_DSE_GUID = '11111111-1111-1111-1111-111111111111'
+
 
 
 # ========================================================================== #
@@ -250,6 +261,7 @@ class SchemaSyntax(object):
 
     def render(self):
         return 'xml'
+
 
 
 SCHEMA_SYNTAX_LIST = [
@@ -294,6 +306,7 @@ ROOT_DSE_ATTRS = {
 }
 
 
+
 # ========================================================================== #
 # LdapAttr                                                                   #
 # ========================================================================== #
@@ -325,6 +338,7 @@ LDAP_ATTR_TEMPLATE = jinja2.Template("""
    <ad:value xsi:type="{{obj.xsi_type}}">{{val}}</ad:value>
    {%- endfor %}
 </addata:{{obj.attr}}>""".strip())
+
 
 
 class LdapAttr(object):
@@ -377,6 +391,7 @@ class LdapAttr(object):
         return LDAP_ATTR_TEMPLATE.render({'obj': self})
 
 
+
 # ========================================================================== #
 # SyntheticAttr                                                              #
 # ========================================================================== #
@@ -410,6 +425,7 @@ SYNTHETIC_ATTR_TEMPLATE = jinja2.Template("""
 </ad:{{obj.attr}}>""".strip())
 
 
+
 class SyntheticAttr(object):
 
     def __init__(self, attr, vals, xsi_type='xsd:string'):
@@ -437,6 +453,7 @@ class SyntheticAttr(object):
         return SYNTHETIC_ATTR_TEMPLATE.render({'obj': self})
 
 
+
 # ========================================================================== #
 # Helper Functions                                                           #
 # ========================================================================== #
@@ -452,11 +469,13 @@ def render_template(template_name, **kwargs):
     return template.render(**kwargs)
 
 
+
 def is_rootDSE(guid):
     """
     Return True if the given GUID string is the sentinel Root DSE GUID.
     """
     return guid.strip() == ROOT_DSE_GUID
+
 
 
 def get_rdn(dn):
@@ -472,6 +491,7 @@ def get_rdn(dn):
     if rdn_name and rdn_value:
         return '%s=%s' % (rdn_name, rdn_value)
     return ''
+
 
 
 # ========================================================================== #
@@ -500,7 +520,6 @@ class SamDBHelper(SamDB):
         # hashes, security descriptors, etc.).
         SamDB.__init__(self, lp=lp, session_info=system_session())
 
-
     def search_scope_base(self, *args, **kwargs):
         """
         Search for exactly one object by DN (LDAP base scope).
@@ -510,7 +529,6 @@ class SamDBHelper(SamDB):
         """
         kwargs['scope'] = ldb.SCOPE_BASE
         return self.search(*args, **kwargs)
-
 
     def search_scope_onelevel(self, *args, **kwargs):
         """
@@ -522,7 +540,6 @@ class SamDBHelper(SamDB):
         kwargs['scope'] = ldb.SCOPE_ONELEVEL
         return self.search(*args, **kwargs)
 
-
     def search_scope_subtree(self, *args, **kwargs):
         """
         Search a container and all its descendants (LDAP subtree scope).
@@ -532,7 +549,6 @@ class SamDBHelper(SamDB):
         """
         kwargs['scope'] = ldb.SCOPE_SUBTREE
         return self.search(*args, **kwargs)
-
 
     def get_rootdse_attr_schema_syntax(self, attr):
         """
@@ -544,7 +560,6 @@ class SamDBHelper(SamDB):
         """
         oid = ROOT_DSE_ATTRS.get(attr)
         return oid and OID_SCHEMA_SYNTAX_DICT.get(oid) or None
-
 
     def get_attr_schema_syntax(self, attr, is_root_dse=False):
         """
@@ -563,7 +578,6 @@ class SamDBHelper(SamDB):
         else:
             oid = self.get_syntax_oid_from_lDAPDisplayName(attr)
         return oid and OID_SCHEMA_SYNTAX_DICT.get(oid) or None
-
 
     def build_attr_list(self, msg, is_root_dse=False, attr_names=[]):
         """
@@ -635,7 +649,6 @@ class SamDBHelper(SamDB):
 
         return attrs
 
-
     def render_root_dse_xml(self, **context):
         """
         Handle a WS-Transfer Get request for the Root DSE.
@@ -664,7 +677,6 @@ class SamDBHelper(SamDB):
         context['attrs'] = attrs
         return render_template('root-DSE.xml', **context)
 
-
     def render_msds_portldap(self, **context):
         """
         Handle a WS-Transfer Get request for msDS-PortLDAP.
@@ -675,7 +687,6 @@ class SamDBHelper(SamDB):
         the port is fixed.
         """
         return render_template('msDS-PortLDAP.xml', **context)
-
 
     def render_transfer_get(self, **context):
         """
@@ -703,7 +714,6 @@ class SamDBHelper(SamDB):
         context['attrs'] = attrs
         return render_template('transfer-Get.xml', **context)
 
-
     def render_enumerate(self, **context):
         """
         Handle a WS-Enumeration Enumerate request.
@@ -715,7 +725,6 @@ class SamDBHelper(SamDB):
         render_pull() when the client sends the matching Pull request.
         """
         return render_template('Enumerate.xml', **context)
-
 
     def render_pull(self, **context):
         """
@@ -808,6 +817,7 @@ class SamDBHelper(SamDB):
         #
         # When BaseObject is non-empty we use it directly as before.
         if LdapQuery['BaseObject']:
+            # Standard single-base search with paged results support.
             result = self.search(
                 base=LdapQuery['BaseObject'],
                 scope=scope,
@@ -815,17 +825,39 @@ class SamDBHelper(SamDB):
                 attrs=attrs_to_fetch,
                 controls=['paged_results:1:%s%s' % (MaxElements, cookie)]
             )
+
+            # Check the paged_results control to determine whether more
+            # pages remain. If absent or cookie is empty this is the
+            # last (or only) page.
+            ctrls = [
+                str(c) for c in result.controls
+                if str(c).startswith('paged_results')
+            ]
+            if ctrls:
+                spl = ctrls[0].rsplit(':', 3)
+                if len(spl) == 3:
+                    # Non-empty cookie -- more results waiting.
+                    new_cookie = ':' + spl[-1]
+                    enumeration_context['cookie'] = new_cookie
+                    context['is_end'] = False
+                else:
+                    context['is_end'] = True
+            else:
+                context['is_end'] = True
+
+            msgs_to_render = list(result.msgs)
+
         else:
-            # Search domain NC and Configuration NC, then merge msgs.
-            # paged_results is applied per-search; since these are
-            # typically small result sets for DC-discovery queries we
-            # use a generous page size and merge without re-paging.
+            # Empty BaseObject means 'search the entire directory'.
+            # Samba rejects a literal empty base DN (error 32). We
+            # approximate a global search by querying the domain NC
+            # and Configuration NC separately and merging the msgs.
+            # These are small DC-discovery result sets so paging is
+            # not needed; we treat the merged set as the final page.
             domain_base = str(self.domain_dn())
             config_base = 'CN=Configuration,' + domain_base
-            search_bases = [domain_base, config_base]
-            all_msgs  = []
-            last_result = None
-            for search_base in search_bases:
+            msgs_to_render = []
+            for search_base in [domain_base, config_base]:
                 try:
                     r = self.search(
                         base=search_base,
@@ -833,40 +865,13 @@ class SamDBHelper(SamDB):
                         expression=LdapQuery['Filter'],
                         attrs=attrs_to_fetch,
                         controls=[
-                            'paged_results:1:%s%s' % (MaxElements, cookie)
+                            'paged_results:1:%s' % MaxElements
                         ]
                     )
-                    all_msgs.extend(r.msgs)
-                    last_result = r
+                    msgs_to_render.extend(list(r.msgs))
                 except Exception:
                     pass
-            # Re-use the last result object as a carrier for controls
-            # and replace its msgs with the merged set.
-            if last_result is not None:
-                last_result.msgs = all_msgs
-            result = last_result
-
-        # Check the paged_results control in the response to determine
-        # whether more pages remain. If absent or the cookie is empty,
-        # this is the last (or only) page of results.
-        ctrls = [
-            str(c) for c in result.controls
-            if str(c).startswith('paged_results')
-        ]
-
-        if ctrls:
-            spl = ctrls[0].rsplit(':', 3)
-            if len(spl) == 3:
-                # Non-empty cookie -- more results waiting. Store it so
-                # the next Pull request picks up where this one left off.
-                new_cookie = ':' + spl[-1]
-                enumeration_context['cookie'] = new_cookie
-                context['is_end'] = False
-            else:
-                # Empty cookie -- this is the final page.
-                context['is_end'] = True
-        else:
-            # No paged_results control at all -- treat as final page.
+            # Multi-NC results are returned as a single complete page.
             context['is_end'] = True
 
         # Build (object_class, attrs) tuples for every result object.
@@ -876,7 +881,7 @@ class SamDBHelper(SamDB):
         # the list is ['top', 'person', 'organizationalPerson', 'user']
         # and we use 'user' as the XML element name.
         objects = []
-        for msg in result.msgs:
+        for msg in msgs_to_render:
             object_class = (
                 str(msg['objectClass'][-1])
                 if 'objectClass' in msg
@@ -897,7 +902,6 @@ class SamDBHelper(SamDB):
 
         context['objects'] = objects
         return render_template('Pull.xml', **context)
-
 
     def render_get_dc(self, **context):
         """
@@ -1110,7 +1114,6 @@ class SamDBHelper(SamDB):
         })
         return render_template('GetADDomainController.xml', **context)
 
-
     def render_topology_action(self, **context):
         """
         Handle a WS-CustomActions TopologyManagement request.
@@ -1146,6 +1149,7 @@ class SamDBHelper(SamDB):
         # All other topology actions are pure handshakes.
         context['action_name'] = action_name
         return render_template('topology-action.xml', **context)
+
 
 
 # ========================================================================== #
