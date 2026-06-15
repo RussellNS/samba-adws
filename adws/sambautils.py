@@ -4,8 +4,8 @@ Script Name:      sambautils.py
 Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
-Script Modified:  2026-Jun-14
-Script Version:   1.1.12
+Script Modified:  2026-Jun-15
+Script Version:   1.1.13
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -145,6 +145,18 @@ Change Log:
            operatingSystemServicePack from the computer account object
            and includes them in the response body. Empty/absent values
            render as nil per the existing template pattern.
+  1.1.13 - Fix ad:all wildcard in render_transfer_get(). When
+           PowerShell sends -Properties * on a WS-Transfer Get (e.g.
+           Get-ADObject -Identity <GUID> -Properties *), the last
+           AttributeType entry is 'ad:all'. render_transfer_get()
+           was passing the literal string 'all' to LDB as an attr
+           name, causing LDB to return internal fields including
+           'controls' which PowerShell rejects with ArgumentException.
+           render_transfer_get() now applies the same ad:all wildcard
+           detection as render_pull(): strips 'all' from attr_names
+           and passes attrs=None to LDB to return all real attributes,
+           then passes an empty list to build_attr_list() to render
+           everything LDB returned.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -767,13 +779,32 @@ class SamDBHelper(SamDB):
         # e.g. 'addata:sAMAccountName' -> 'sAMAccountName'
         attr_names = [attr.split(':')[-1] for attr in AttributeType_List]
 
+        # Wildcard detection: PowerShell sends 'ad:all' as the last
+        # AttributeType when the caller uses -Properties *. After
+        # stripping the namespace prefix it becomes the literal string
+        # 'all', which is not a valid LDB attribute name. LDB returns
+        # internal fields (including 'controls') when passed 'all' as
+        # an attribute name, causing PowerShell to reject the response
+        # with "Encountered attribute 'controls'". We apply the same
+        # fix as render_pull(): strip 'all' and pass attrs=None to LDB
+        # so it returns all real attributes, then pass an empty list to
+        # build_attr_list() so it renders everything LDB returned.
+        fetch_all = 'all' in attr_names
+        if fetch_all:
+            attr_names   = [a for a in attr_names if a != 'all']
+            ldb_attrs    = None
+            build_names  = []
+        else:
+            ldb_attrs    = attr_names
+            build_names  = attr_names
+
         result = self.search(
             base=context['objectReferenceProperty'],
-            attrs=attr_names,
+            attrs=ldb_attrs,
             controls=[])
 
         msg   = result[0]
-        attrs = self.build_attr_list(msg, attr_names=attr_names)
+        attrs = self.build_attr_list(msg, attr_names=build_names)
 
         context['attrs'] = attrs
         return render_template('transfer-Get.xml', **context)
