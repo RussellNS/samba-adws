@@ -122,7 +122,7 @@ Change Log:
            DC. render_pull() now injects these two attributes into
            any computer object in a Pull response when they are
            present in LDB but absent from the requested attr list.
-  1.1.10  - Fix DC-qualification attribute injection. v1.1.9 checked
+  1.1.10 - Fix DC-qualification attribute injection. v1.1.9 checked
            whether userAccountControl and primaryGroupID were present
            in the LDB result msg, but they were never fetched because
            they were not in attrs_to_fetch. The fix always appends
