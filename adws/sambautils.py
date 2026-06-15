@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
 Script Modified:  2026-Jun-14
-Script Version:   1.1.10
+Script Version:   1.1.11
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -129,6 +129,15 @@ Change Log:
            these two attributes to attrs_to_fetch so LDB returns them,
            and build_attr_list() renders them for computer objects
            regardless of whether the client requested them.
+  1.1.11 - Fix InvocationId in GetADDomainControllerResponse. The
+           field was populated with the nTDSDSA invocationId attribute
+           (a replication GUID), but PowerShell uses the nTDSDSA
+           objectGUID to correlate the topology response with the
+           nTDSDSA Pull result. Since they differ, PowerShell could
+           not match the two responses and threw
+           ADIdentityNotFoundException. render_get_dc() now reads
+           objectGUID from the nTDSDSA object and decodes it as the
+           InvocationId value.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -1144,24 +1153,23 @@ class SamDBHelper(SamDB):
         else:
             server_guid = ''
 
-        # invocationId is stored as a raw GUID bytes value
-        if 'invocationId' in ntds_msg:
-            inv_raw = bytes(ntds_msg['invocationId'][0])
+        # InvocationId in the ADWS response must be the objectGUID of
+        # the nTDSDSA object, not the invocationId attribute. PowerShell
+        # uses this value to correlate the topology response with the
+        # nTDSDSA object returned by the follow-up Enumerate/Pull.
+        # The nTDSDSA objectGUID is already in ntds_msg; we decode it
+        # using the same little-endian struct pattern as server_guid.
+        if 'objectGUID' in ntds_msg:
+            ntds_guid_raw = bytes(ntds_msg['objectGUID'][0])
         else:
-            inv_raw = b''
-        if len(inv_raw) == 16:
+            ntds_guid_raw = b''
+        if len(ntds_guid_raw) == 16:
+            p3 = struct.unpack('<IHH8B', ntds_guid_raw)
             inv_id = (
                 '%08x-%04x-%04x-%02x%02x-'
                 '%02x%02x%02x%02x%02x%02x'
-            ) % (p[0], p[1], p[2], p[3], p[4],
-                 p[5], p[6], p[7], p[8], p[9], p[10])
-            import struct
-            p2 = struct.unpack('<IHH8B', inv_raw)
-            inv_id = (
-                '%08x-%04x-%04x-%02x%02x-'
-                '%02x%02x%02x%02x%02x%02x'
-            ) % (p2[0], p2[1], p2[2], p2[3], p2[4],
-                 p2[5], p2[6], p2[7], p2[8], p2[9], p2[10])
+            ) % (p3[0], p3[1], p3[2], p3[3], p3[4],
+                 p3[5], p3[6], p3[7], p3[8], p3[9], p3[10])
         else:
             inv_id = ''
 
