@@ -56,10 +56,10 @@
             <LdapPort>{{LdapPort}}</LdapPort>
             <Name>{{Name}}</Name>
             <NTDSSettingsDN>{{NtdsSettingsDN}}</NTDSSettingsDN>
-            <OperatingSystem i:nil="true"/>
-            <OperatingSystemHotfix i:nil="true"/>
-            <OperatingSystemServicePack i:nil="true"/>
-            <OperatingSystemVersion i:nil="true"/>
+            {% if OperatingSystem %}<OperatingSystem>{{OperatingSystem}}</OperatingSystem>{% else %}<OperatingSystem i:nil="true"/>{% endif %}
+            {% if OperatingSystemHotfix %}<OperatingSystemHotfix>{{OperatingSystemHotfix}}</OperatingSystemHotfix>{% else %}<OperatingSystemHotfix i:nil="true"/>{% endif %}
+            {% if OperatingSystemServicePack %}<OperatingSystemServicePack>{{OperatingSystemServicePack}}</OperatingSystemServicePack>{% else %}<OperatingSystemServicePack i:nil="true"/>{% endif %}
+            {% if OperatingSystemVersion %}<OperatingSystemVersion>{{OperatingSystemVersion}}</OperatingSystemVersion>{% else %}<OperatingSystemVersion i:nil="true"/>{% endif %}
             <OperationMasterRoles>
                 {% for role in OperationMasterRoles %}
                 <b:string>{{role}}</b:string>

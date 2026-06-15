@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
 Script Modified:  2026-Jun-14
-Script Version:   1.1.11
+Script Version:   1.1.12
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -138,6 +138,13 @@ Change Log:
            ADIdentityNotFoundException. render_get_dc() now reads
            objectGUID from the nTDSDSA object and decodes it as the
            InvocationId value.
+  1.1.12 - Populate OperatingSystem fields in
+           GetADDomainControllerResponse. The OS fields were hardcoded
+           as nil/empty. render_get_dc() now fetches operatingSystem,
+           operatingSystemVersion, operatingSystemHotfix, and
+           operatingSystemServicePack from the computer account object
+           and includes them in the response body. Empty/absent values
+           render as nil per the existing template pattern.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -1133,7 +1140,10 @@ class SamDBHelper(SamDB):
                     base=computer_dn,
                     scope=ldb.SCOPE_BASE,
                     expression='(objectClass=*)',
-                    attrs=['objectGUID']
+                    attrs=['objectGUID', 'operatingSystem',
+                           'operatingSystemVersion',
+                           'operatingSystemHotfix',
+                           'operatingSystemServicePack']
                 )
                 if comp_result and 'objectGUID' in comp_result[0]:
                     computer_guid_raw = bytes(
@@ -1173,6 +1183,17 @@ class SamDBHelper(SamDB):
         else:
             inv_id = ''
 
+        # Extract OS fields from the computer account object.
+        # These are stored on the computer object in the domain NC.
+        # comp_result may be empty if the computer DN was not found.
+        comp_msg = comp_result[0] if comp_result else None
+
+        def _comp_str(attr):
+            # Return string value of attr from comp_msg, or None.
+            if comp_msg and attr in comp_msg:
+                return str(comp_msg[attr][0])
+            return None
+
         context.update({
             'NtdsSettingsDN':   ntds_dn,
             'ServerObjectDN':   server_dn,
@@ -1195,7 +1216,12 @@ class SamDBHelper(SamDB):
             'LdapPort':         '389',
             'SslPort':          '636',
             'Enabled':          'true',
-            'OperationMasterRoles': roles,
+            'OperationMasterRoles':       roles,
+            'OperatingSystem':            _comp_str('operatingSystem'),
+            'OperatingSystemVersion':     _comp_str('operatingSystemVersion'),
+            'OperatingSystemHotfix':      _comp_str('operatingSystemHotfix'),
+            'OperatingSystemServicePack': _comp_str(
+                                    'operatingSystemServicePack'),
         })
         return render_template('GetADDomainController.xml', **context)
 
