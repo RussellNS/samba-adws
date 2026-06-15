@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
 Script Modified:  2026-Jun-14
-Script Version:   1.1.8
+Script Version:   1.1.9
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -113,6 +113,15 @@ Change Log:
            directly from all_msgs without using a carrier result
            object, bypassing the paged_results control path entirely
            (multi-NC results are small and do not need paging).
+  1.1.9  - Inject DC-qualification attributes into computer Pull
+           responses. PowerShell requires userAccountControl and
+           primaryGroupID to confirm a computer object is a DC
+           account. These attributes are never in the narrow 6-attr
+           selection that Get-ADDomainController sends, so PowerShell
+           receives the computer object but cannot determine it is a
+           DC. render_pull() now injects these two attributes into
+           any computer object in a Pull response when they are
+           present in LDB but absent from the requested attr list.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -453,7 +462,6 @@ class SyntheticAttr(object):
         return SYNTHETIC_ATTR_TEMPLATE.render({'obj': self})
 
 
-
 # ========================================================================== #
 # Helper Functions                                                           #
 # ========================================================================== #
@@ -520,6 +528,8 @@ class SamDBHelper(SamDB):
         # hashes, security descriptors, etc.).
         SamDB.__init__(self, lp=lp, session_info=system_session())
 
+
+
     def search_scope_base(self, *args, **kwargs):
         """
         Search for exactly one object by DN (LDAP base scope).
@@ -529,6 +539,8 @@ class SamDBHelper(SamDB):
         """
         kwargs['scope'] = ldb.SCOPE_BASE
         return self.search(*args, **kwargs)
+
+
 
     def search_scope_onelevel(self, *args, **kwargs):
         """
@@ -540,6 +552,8 @@ class SamDBHelper(SamDB):
         kwargs['scope'] = ldb.SCOPE_ONELEVEL
         return self.search(*args, **kwargs)
 
+
+
     def search_scope_subtree(self, *args, **kwargs):
         """
         Search a container and all its descendants (LDAP subtree scope).
@@ -549,6 +563,8 @@ class SamDBHelper(SamDB):
         """
         kwargs['scope'] = ldb.SCOPE_SUBTREE
         return self.search(*args, **kwargs)
+
+
 
     def get_rootdse_attr_schema_syntax(self, attr):
         """
@@ -560,6 +576,8 @@ class SamDBHelper(SamDB):
         """
         oid = ROOT_DSE_ATTRS.get(attr)
         return oid and OID_SCHEMA_SYNTAX_DICT.get(oid) or None
+
+
 
     def get_attr_schema_syntax(self, attr, is_root_dse=False):
         """
@@ -578,6 +596,8 @@ class SamDBHelper(SamDB):
         else:
             oid = self.get_syntax_oid_from_lDAPDisplayName(attr)
         return oid and OID_SCHEMA_SYNTAX_DICT.get(oid) or None
+
+
 
     def build_attr_list(self, msg, is_root_dse=False, attr_names=[]):
         """
@@ -649,6 +669,8 @@ class SamDBHelper(SamDB):
 
         return attrs
 
+
+
     def render_root_dse_xml(self, **context):
         """
         Handle a WS-Transfer Get request for the Root DSE.
@@ -677,6 +699,8 @@ class SamDBHelper(SamDB):
         context['attrs'] = attrs
         return render_template('root-DSE.xml', **context)
 
+
+
     def render_msds_portldap(self, **context):
         """
         Handle a WS-Transfer Get request for msDS-PortLDAP.
@@ -687,6 +711,8 @@ class SamDBHelper(SamDB):
         the port is fixed.
         """
         return render_template('msDS-PortLDAP.xml', **context)
+
+
 
     def render_transfer_get(self, **context):
         """
@@ -714,6 +740,8 @@ class SamDBHelper(SamDB):
         context['attrs'] = attrs
         return render_template('transfer-Get.xml', **context)
 
+
+
     def render_enumerate(self, **context):
         """
         Handle a WS-Enumeration Enumerate request.
@@ -725,6 +753,8 @@ class SamDBHelper(SamDB):
         render_pull() when the client sends the matching Pull request.
         """
         return render_template('Enumerate.xml', **context)
+
+
 
     def render_pull(self, **context):
         """
@@ -880,6 +910,14 @@ class SamDBHelper(SamDB):
         # most-derived. The last value is what we want: e.g. for a user
         # the list is ['top', 'person', 'organizationalPerson', 'user']
         # and we use 'user' as the XML element name.
+        # Attributes required to qualify a computer object as a DC.
+        # PowerShell checks these to determine whether a computer
+        # account is a domain controller rather than a workstation.
+        # They are never included in the narrow selection list that
+        # Get-ADDomainController sends, so we inject them when
+        # present in LDB but absent from the client's request.
+        DC_QUAL_ATTRS = ['userAccountControl', 'primaryGroupID']
+
         objects = []
         for msg in msgs_to_render:
             object_class = (
@@ -893,15 +931,33 @@ class SamDBHelper(SamDB):
             # and renders every attribute LDB returned. When False,
             # pass attr_names so only the requested attrs are rendered
             # and objectClass is excluded unless the client asked for it.
+            effective_attr_names = [] if fetch_all else attr_names
+
+            # For computer objects, inject DC-qualification attributes
+            # if they are present in the LDB result but not in the
+            # client's selection list. This allows PowerShell to
+            # identify the object as a DC account without a separate
+            # lookup. We only inject when the LDB result actually
+            # contains the attribute so we never fabricate data.
+            if object_class == 'computer' and not fetch_all:
+                extra = [
+                    a for a in DC_QUAL_ATTRS
+                    if a not in attr_names and a in msg
+                ]
+                if extra:
+                    effective_attr_names = list(attr_names) + extra
+
             attrs = self.build_attr_list(
                 msg,
-                attr_names=[] if fetch_all else attr_names
+                attr_names=effective_attr_names
             )
 
             objects.append((object_class, attrs))
 
         context['objects'] = objects
         return render_template('Pull.xml', **context)
+
+
 
     def render_get_dc(self, **context):
         """
@@ -1113,6 +1169,8 @@ class SamDBHelper(SamDB):
             'OperationMasterRoles': roles,
         })
         return render_template('GetADDomainController.xml', **context)
+
+
 
     def render_topology_action(self, **context):
         """
