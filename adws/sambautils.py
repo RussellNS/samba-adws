@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
 Script Modified:  2026-Jun-14
-Script Version:   1.1.9
+Script Version:   1.2.0
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -122,6 +122,13 @@ Change Log:
            DC. render_pull() now injects these two attributes into
            any computer object in a Pull response when they are
            present in LDB but absent from the requested attr list.
+  1.2.0  - Fix DC-qualification attribute injection. v1.1.9 checked
+           whether userAccountControl and primaryGroupID were present
+           in the LDB result msg, but they were never fetched because
+           they were not in attrs_to_fetch. The fix always appends
+           these two attributes to attrs_to_fetch so LDB returns them,
+           and build_attr_list() renders them for computer objects
+           regardless of whether the client requested them.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -129,6 +136,8 @@ To Do List:
   *  Implement MS-ADCAP custom operations (password change, unlock, etc.).
 ------------------------------------------------------------------------------
 """
+
+
 from __future__ import print_function, absolute_import
 import ldb
 import re
@@ -141,7 +150,6 @@ from os.path import abspath, dirname, join
 import jinja2
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from base64 import b64encode
-
 
 
 # ========================================================================== #
@@ -166,7 +174,6 @@ SYNTAX_GENERALIZED_TIME  = getattr(ldb, 'SYNTAX_GENERALIZED_TIME',  1)
 SYNTAX_OBJECT_IDENTIFIER = getattr(ldb, 'SYNTAX_OBJECT_IDENTIFIER', 1)
 
 
-
 # ========================================================================== #
 # XML 1.0 Illegal Character Pattern                                          #
 # ========================================================================== #
@@ -189,7 +196,6 @@ XML_ILLEGAL_CHARS = re.compile(
 )
 
 
-
 # ========================================================================== #
 # Jinja2 Template Engine Setup                                               #
 # ========================================================================== #
@@ -209,7 +215,6 @@ ENV = Environment(
 )
 
 
-
 # ========================================================================== #
 # LDAP Scope Mapping                                                         #
 # ========================================================================== #
@@ -225,6 +230,18 @@ SCOPE_ADLQ_TO_LDB = {
 }
 
 
+# ========================================================================== #
+# DC Qualification Attributes                                                #
+# ========================================================================== #
+# These attributes are required for PowerShell to identify a computer
+# object as a domain controller rather than a workstation. They are
+# always fetched from LDB and injected into Pull responses for computer
+# objects even when the client did not explicitly request them.
+#   userAccountControl - must have UF_SERVER_TRUST_ACCOUNT (0x1000)
+#   primaryGroupID     - must be 516 (Domain Controllers group)
+
+DC_QUAL_ATTRS = ['userAccountControl', 'primaryGroupID']
+
 
 # ========================================================================== #
 # Root DSE Sentinel GUID                                                     #
@@ -236,7 +253,6 @@ SCOPE_ADLQ_TO_LDB = {
 # object.
 
 ROOT_DSE_GUID = '11111111-1111-1111-1111-111111111111'
-
 
 
 # ========================================================================== #
@@ -270,7 +286,6 @@ class SchemaSyntax(object):
 
     def render(self):
         return 'xml'
-
 
 
 SCHEMA_SYNTAX_LIST = [
@@ -315,7 +330,6 @@ ROOT_DSE_ATTRS = {
 }
 
 
-
 # ========================================================================== #
 # LdapAttr                                                                   #
 # ========================================================================== #
@@ -347,7 +361,6 @@ LDAP_ATTR_TEMPLATE = jinja2.Template("""
    <ad:value xsi:type="{{obj.xsi_type}}">{{val}}</ad:value>
    {%- endfor %}
 </addata:{{obj.attr}}>""".strip())
-
 
 
 class LdapAttr(object):
@@ -400,7 +413,6 @@ class LdapAttr(object):
         return LDAP_ATTR_TEMPLATE.render({'obj': self})
 
 
-
 # ========================================================================== #
 # SyntheticAttr                                                              #
 # ========================================================================== #
@@ -432,7 +444,6 @@ SYNTHETIC_ATTR_TEMPLATE = jinja2.Template("""
    <ad:value xsi:type="{{obj.xsi_type}}">{{val}}</ad:value>
    {%- endfor %}
 </ad:{{obj.attr}}>""".strip())
-
 
 
 class SyntheticAttr(object):
@@ -477,13 +488,11 @@ def render_template(template_name, **kwargs):
     return template.render(**kwargs)
 
 
-
 def is_rootDSE(guid):
     """
     Return True if the given GUID string is the sentinel Root DSE GUID.
     """
     return guid.strip() == ROOT_DSE_GUID
-
 
 
 def get_rdn(dn):
@@ -499,7 +508,6 @@ def get_rdn(dn):
     if rdn_name and rdn_value:
         return '%s=%s' % (rdn_name, rdn_value)
     return ''
-
 
 
 # ========================================================================== #
@@ -529,7 +537,6 @@ class SamDBHelper(SamDB):
         SamDB.__init__(self, lp=lp, session_info=system_session())
 
 
-
     def search_scope_base(self, *args, **kwargs):
         """
         Search for exactly one object by DN (LDAP base scope).
@@ -539,7 +546,6 @@ class SamDBHelper(SamDB):
         """
         kwargs['scope'] = ldb.SCOPE_BASE
         return self.search(*args, **kwargs)
-
 
 
     def search_scope_onelevel(self, *args, **kwargs):
@@ -553,7 +559,6 @@ class SamDBHelper(SamDB):
         return self.search(*args, **kwargs)
 
 
-
     def search_scope_subtree(self, *args, **kwargs):
         """
         Search a container and all its descendants (LDAP subtree scope).
@@ -563,7 +568,6 @@ class SamDBHelper(SamDB):
         """
         kwargs['scope'] = ldb.SCOPE_SUBTREE
         return self.search(*args, **kwargs)
-
 
 
     def get_rootdse_attr_schema_syntax(self, attr):
@@ -576,7 +580,6 @@ class SamDBHelper(SamDB):
         """
         oid = ROOT_DSE_ATTRS.get(attr)
         return oid and OID_SCHEMA_SYNTAX_DICT.get(oid) or None
-
 
 
     def get_attr_schema_syntax(self, attr, is_root_dse=False):
@@ -596,7 +599,6 @@ class SamDBHelper(SamDB):
         else:
             oid = self.get_syntax_oid_from_lDAPDisplayName(attr)
         return oid and OID_SCHEMA_SYNTAX_DICT.get(oid) or None
-
 
 
     def build_attr_list(self, msg, is_root_dse=False, attr_names=[]):
@@ -670,7 +672,6 @@ class SamDBHelper(SamDB):
         return attrs
 
 
-
     def render_root_dse_xml(self, **context):
         """
         Handle a WS-Transfer Get request for the Root DSE.
@@ -700,7 +701,6 @@ class SamDBHelper(SamDB):
         return render_template('root-DSE.xml', **context)
 
 
-
     def render_msds_portldap(self, **context):
         """
         Handle a WS-Transfer Get request for msDS-PortLDAP.
@@ -711,7 +711,6 @@ class SamDBHelper(SamDB):
         the port is fixed.
         """
         return render_template('msDS-PortLDAP.xml', **context)
-
 
 
     def render_transfer_get(self, **context):
@@ -741,7 +740,6 @@ class SamDBHelper(SamDB):
         return render_template('transfer-Get.xml', **context)
 
 
-
     def render_enumerate(self, **context):
         """
         Handle a WS-Enumeration Enumerate request.
@@ -753,7 +751,6 @@ class SamDBHelper(SamDB):
         render_pull() when the client sends the matching Pull request.
         """
         return render_template('Enumerate.xml', **context)
-
 
 
     def render_pull(self, **context):
@@ -821,7 +818,7 @@ class SamDBHelper(SamDB):
         fetch_all = 'all' in attr_names
         if fetch_all:
             attr_names = [a for a in attr_names if a != 'all']
-            attrs_to_fetch          = None
+            attrs_to_fetch               = None
             client_requested_objectclass = True
         else:
             # Always include objectClass in the LDB query so we can
@@ -829,11 +826,18 @@ class SamDBHelper(SamDB):
             # Track whether the client asked for it so we can strip it
             # from the rendered attr list if they did not.
             client_requested_objectclass = 'objectClass' in attr_names
-            attrs_to_fetch = (
+            base_fetch = (
                 attr_names
                 if client_requested_objectclass
                 else attr_names + ['objectClass']
             )
+            # Always fetch DC-qualification attributes from LDB so
+            # they are available for injection into computer object
+            # responses. If already in the list they are not duplicated.
+            for _dc_attr in DC_QUAL_ATTRS:
+                if _dc_attr not in base_fetch:
+                    base_fetch = base_fetch + [_dc_attr]
+            attrs_to_fetch = base_fetch
 
         # An empty BaseObject means 'search the entire directory'.
         # Samba's LDB partition module rejects a literal empty base DN
@@ -910,14 +914,6 @@ class SamDBHelper(SamDB):
         # most-derived. The last value is what we want: e.g. for a user
         # the list is ['top', 'person', 'organizationalPerson', 'user']
         # and we use 'user' as the XML element name.
-        # Attributes required to qualify a computer object as a DC.
-        # PowerShell checks these to determine whether a computer
-        # account is a domain controller rather than a workstation.
-        # They are never included in the narrow selection list that
-        # Get-ADDomainController sends, so we inject them when
-        # present in LDB but absent from the client's request.
-        DC_QUAL_ATTRS = ['userAccountControl', 'primaryGroupID']
-
         objects = []
         for msg in msgs_to_render:
             object_class = (
@@ -956,7 +952,6 @@ class SamDBHelper(SamDB):
 
         context['objects'] = objects
         return render_template('Pull.xml', **context)
-
 
 
     def render_get_dc(self, **context):
@@ -1171,7 +1166,6 @@ class SamDBHelper(SamDB):
         return render_template('GetADDomainController.xml', **context)
 
 
-
     def render_topology_action(self, **context):
         """
         Handle a WS-CustomActions TopologyManagement request.
@@ -1207,7 +1201,6 @@ class SamDBHelper(SamDB):
         # All other topology actions are pure handshakes.
         context['action_name'] = action_name
         return render_template('topology-action.xml', **context)
-
 
 
 # ========================================================================== #
