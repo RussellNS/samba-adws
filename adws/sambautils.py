@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
 Script Modified:  2026-Jun-15
-Script Version:   1.1.13
+Script Version:   1.1.14
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -157,6 +157,15 @@ Change Log:
            and passes attrs=None to LDB to return all real attributes,
            then passes an empty list to build_attr_list() to render
            everything LDB returned.
+  1.1.14 - Fix WS-Transfer Get with no AttributeTypeList. Some Get
+           requests (e.g. Get-ADObject -Identity <GUID> -Properties *)
+           send only LDAP controls in the body with no AttributeType
+           elements. render_transfer_get() was passing attrs=[] to LDB
+           which caused it to return all attributes including internal
+           LDB fields. The fix treats an empty AttributeType_List the
+           same as fetch_all: pass attrs=None to LDB and an empty list
+           to build_attr_list() so all real attributes are returned
+           but internal fields are filtered out by the schema lookup.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -779,24 +788,32 @@ class SamDBHelper(SamDB):
         # e.g. 'addata:sAMAccountName' -> 'sAMAccountName'
         attr_names = [attr.split(':')[-1] for attr in AttributeType_List]
 
-        # Wildcard detection: PowerShell sends 'ad:all' as the last
-        # AttributeType when the caller uses -Properties *. After
-        # stripping the namespace prefix it becomes the literal string
-        # 'all', which is not a valid LDB attribute name. LDB returns
-        # internal fields (including 'controls') when passed 'all' as
-        # an attribute name, causing PowerShell to reject the response
-        # with "Encountered attribute 'controls'". We apply the same
-        # fix as render_pull(): strip 'all' and pass attrs=None to LDB
-        # so it returns all real attributes, then pass an empty list to
-        # build_attr_list() so it renders everything LDB returned.
-        fetch_all = 'all' in attr_names
+        # Wildcard / empty-list detection.
+        #
+        # Case 1 -- 'ad:all' wildcard: PowerShell sends 'ad:all' as the
+        # last AttributeType when the caller uses -Properties *. After
+        # stripping the namespace prefix it becomes the literal 'all',
+        # which is not a valid LDB attribute name.
+        #
+        # Case 2 -- empty AttributeType_List: some Get requests (e.g.
+        # Get-ADObject -Identity <GUID> -Properties *) place LDAP
+        # controls in the body but no AttributeType elements at all.
+        # Passing attrs=[] to LDB returns all attributes including
+        # internal fields such as 'controls', which PowerShell rejects
+        # with "Encountered attribute 'controls'".
+        #
+        # In both cases the correct behaviour is to pass attrs=None to
+        # LDB (returning all real schema attributes) and an empty list
+        # to build_attr_list() so it derives the rendered set from
+        # msg.keys(), which excludes internal LDB fields via the schema
+        # syntax lookup in get_attr_schema_syntax().
+        fetch_all = (not attr_names) or ('all' in attr_names)
         if fetch_all:
-            attr_names   = [a for a in attr_names if a != 'all']
-            ldb_attrs    = None
-            build_names  = []
+            ldb_attrs   = None
+            build_names = []
         else:
-            ldb_attrs    = attr_names
-            build_names  = attr_names
+            ldb_attrs   = attr_names
+            build_names = attr_names
 
         result = self.search(
             base=context['objectReferenceProperty'],
