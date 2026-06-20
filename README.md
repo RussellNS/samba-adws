@@ -1,7 +1,7 @@
 # Active Directory Web Services (ADWS) Proxy for Samba
 
 > [!NOTE]
-> This is a fork of the [Catalyst Samba-ADWS Project on GitLab](https://gitlab.com/catalyst-samba/samba-adws) as referenced on the [AD PowerShell compatibility](https://wiki.samba.org/index.php/ADWS_/_AD_Powershell_compatibility) page on [SambaWiki](https://wiki.samba.org/index.php/Main_Page). The original project (2018) targeted an older Samba release and Python 2.x. The Cayalyst Samba-ADWS Project worked in 2018, but does not work in 2026. The goal of this fork is to make it work, modernize it with Python 3.x, (4.x), and add meaningful compatibility with the AD PowerShell module (RSAT) as shipped with Windows 10/11 and Windows Server 2019/2022/2025.
+> This is a fork of the [Catalyst Samba-ADWS Project on GitLab](https://gitlab.com/catalyst-samba/samba-adws) as referenced on the [AD PowerShell compatibility](https://wiki.samba.org/index.php/ADWS_/_AD_Powershell_compatibility) page on [SambaWiki](https://wiki.samba.org/index.php/Main_Page). The original project (2018) targeted an older Samba release and Python 2.x. The Cayalyst Samba-ADWS Project worked in 2018, but does not work in 2026. The goal of this fork is to make it work, modernize it with Python 3.x, Samba 4.x, and add meaningful compatibility with the AD PowerShell module (RSAT) as shipped with Windows 10/11 and Windows Server 2019/2022/2025.
 
 ---
 
