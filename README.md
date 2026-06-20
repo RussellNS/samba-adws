@@ -19,7 +19,11 @@ The intended deployment is alongside the [samba-ad-dc-lab](https://github.com/Ru
 
 ## What Works
 
-The Catalyst Samba-ADWS Project was a proof of concept (POC).  In this POC, it was hard coded to only pull computer objects.  So `Get-ADComputer` worked with minimal functionality (i.e. it might pull some computer properties for a computer object in AD but fail on others, especially those with non-escaped XML characters in the return).
+The Catalyst Samba-ADWS Project was a proof of concept (POC).  In this POC, it was hard coded to only pull computer objects.  So `Get-ADComputer` worked, but it worked with minimal functionality (i.e. it might pull some computer properties for a computer object in AD but fail on others, especially those with non-escaped XML characters in the return).  Also, no other PowerShell cmdlets in the **AD PowerShell module** worked, including:
+- Get-ADUser
+- Get-ADGroup
+- Get-ADOject
+- etc.
 
 In the first release (v1.0.0) of this repo, the goal, as stated earlier, was just to get the previous repo working with current packages (Python 3.x, Samba 4.x, ect.).  That goal was met.
 
