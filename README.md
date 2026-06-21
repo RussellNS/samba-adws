@@ -154,6 +154,6 @@ Most AD PowerShell cmdlets use standard Enumerate + Pull, so if the LDAP filter 
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[GPL-3](https://github.com/russellns/samba-adws?tab=GPL-3.0-1-ov-file) — see [LICENSE](LICENSE).
 
 The upstream WCF/NMF library (`wcf/`, `nettcp/`) retains its original license from the [catalyst-samba/samba-adws](https://gitlab.com/catalyst-samba/samba-adws) project.
