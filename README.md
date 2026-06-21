@@ -9,9 +9,7 @@
 
 Active Directory Web Services (ADWS) is the protocol that Windows' **AD PowerShell module** (RSAT) uses to talk to a Domain Controller. It runs on port **9389** over a WCF `net.tcp` binding and wraps LDAP operations in SOAP envelopes encoded in WCF binary XML.
 
-Samba ships with an ADWS stub, but it is not functional for modern PowerShell. This proxy sits
-between PowerShell and Samba's LDAP layer, speaking ADWS on port 9389 to the client and
-translating requests into LDB queries against the running Samba AD DC.
+Samba ships with an ADWS stub, but it is not functional for modern PowerShell. This proxy sits between PowerShell and Samba's LDAP layer, speaking ADWS on port 9389 to the client and translating requests into LDB queries against the running Samba AD DC.
 
 The intended deployment is alongside the [samba-ad-dc-lab](https://github.com/RussellNS/samba-ad-dc-lab) container — a single Docker image that provides a fully provisioned Samba AD DC plus this ADWS proxy, making the combined stack addressable by standard Windows RSAT tools without any modification to the Windows client.
 
@@ -19,7 +17,7 @@ The intended deployment is alongside the [samba-ad-dc-lab](https://github.com/Ru
 
 ## What Works
 
-The Catalyst Samba-ADWS Project was a proof of concept (POC).  In this POC, it was hard coded to only pull computer objects.  So `Get-ADComputer` worked, but it worked with minimal functionality (i.e. it might pull some computer properties for a computer object in AD but fail on others, especially those with non-escaped XML characters in the return).  Also, no other PowerShell cmdlets in the **AD PowerShell module** worked, including:
+The Catalyst Samba-ADWS Project was a proof of concept (POC).  In this POC, it was hard coded to only pull computer objects.  So `Get-ADComputer` worked, but it worked with minimal functionality (i.e. it might pull some computer properties but fail on others, especially those with non-escaped XML characters in the return).  Also, no other PowerShell cmdlets in the **AD PowerShell module** worked, including:
 - Get-ADUser
 - Get-ADGroup
 - Get-ADOject
@@ -146,9 +144,7 @@ docker exec samba-ad-dc cat /tmp/1.xml   # second exchange
 
 ### Adding support for a new cmdlet
 
-Most AD PowerShell cmdlets use standard Enumerate + Pull, so if the LDAP filter and attribute
-list are well-formed, they will work without any code changes. The cases that require explicit
-handling are:
+Most AD PowerShell cmdlets use standard Enumerate + Pull, so if the LDAP filter and attribute list are well-formed, they will work without any code changes. The cases that require explicit handling are:
 
 1. **TopologyManagement CustomActions** — `Get-ADDomainController`, `Get-ADDomain`, `Get-ADForest`. These use a bespoke request/response format defined in `MS-ADCAP` and require a dedicated handler in `render_topology_action()`.
 2. **WS-Transfer Get with no AttributeTypeList** — triggered by `-Properties *` on an Identity-based lookup. Handled by `render_transfer_get()` with `fetch_all=True`.
