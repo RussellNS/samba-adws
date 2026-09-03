@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # coding: utf8
+import os
 import re
 
 from lxml import etree
@@ -39,13 +40,32 @@ def elem_tostring(elem, pretty_print=True, encoding='unicode'):
 
 
 def print_xml(xml, sn=0, mode='w+'):
+    """
+    Validate an XML string and dump it for inspection.
+
+    The parse is not incidental -- it is what catches malformed
+    responses before they are encoded and sent, so it stays even when
+    the dump target changes.
+
+    Destination is the ADWS_RECORD_DIR directory when recording is
+    enabled (so the SOAP exchange sits alongside the LDB calls it
+    provoked), otherwise the historical /tmp/<n>.xml location. Each
+    file holds the request followed by the response for that exchange.
+    """
     # parse to validate
     root = etree.fromstring(xml)
-    # print('######################XML HEAD##########################')
-    # xml2 = etree.tostring(root, pretty_print=True)
-    # print(xml2)
-    # print('######################XML TAIL##########################')
-    with open('/tmp/%s.xml' % sn, mode) as f:
+
+    # Imported lazily to keep this module importable without the rest
+    # of the adws package (tests import xmlutils on its own).
+    from adws.record import record_dir
+
+    target_dir = record_dir() or '/tmp'
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError:
+        target_dir = '/tmp'
+
+    with open(os.path.join(target_dir, '%s.xml' % sn), mode) as f:
         f.write(xml + '\n\n\n')
 
 

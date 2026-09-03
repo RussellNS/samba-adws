@@ -1,0 +1,18 @@
+# Development / test dependencies.
+#
+# The stubbed test suite needs only these -- python3-samba is NOT
+# required and is deliberately not listed, because the point of the
+# stubs is that the suite runs on a workstation with no Samba.
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements-dev.txt
+#   .venv/bin/pytest
+#
+# For the live suite, run inside the samba-ad-dc container where
+# python3-samba is already present:
+#
+#   pytest -m live
+
+pytest
+jinja2
+lxml

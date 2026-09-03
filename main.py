@@ -16,6 +16,7 @@ from wcf.xml2records import XMLParser
 from wcf.records import dump_records
 from adws import sambautils
 from adws import xmlutils
+from adws import record
 
 # --- Logging Configuration ---
 LOG_FORMAT = ('%(levelname)-10s %(asctime)s pid:%(process)d '
@@ -128,6 +129,11 @@ class NETTCPProxy(SocketServer.BaseRequestHandler):
         # Samba helper to interact with the local AD database (LDB)
         samdbhelper = sambautils.SamDBHelper()
 
+        # Optionally wrap the helper so every LDB call is captured to
+        # disk for offline replay by the test suite. Inert unless the
+        # ADWS_RECORD_DIR environment variable is set -- see adws/record.py.
+        samdbhelper = record.maybe_wrap(samdbhelper)
+
         while True:
             log.debug('\n\nstart parsing stream...')
             
@@ -178,6 +184,11 @@ class NETTCPProxy(SocketServer.BaseRequestHandler):
                 # This is a SOAP/XML Message
                 # payload_to_xml() must return a STR in Python 3
                 xml = obj.payload_to_xml()
+
+                # Tag any LDB calls this exchange makes with its index,
+                # so recorded directory traffic can be correlated with
+                # the SOAP request that caused it. No-op unless recording.
+                record.set_exchange(samdbhelper, request_index)
 
                 # Log XML to file/console for debugging
                 xmlutils.print_xml(xml, request_index, mode='w+')

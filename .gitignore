@@ -104,3 +104,7 @@ Session.vim
 *~
 # auto-generated tag files
 tags
+
+# Test harness
+.pytest_cache/
+.venv/
