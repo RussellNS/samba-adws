@@ -35,6 +35,7 @@ Script Desc:      TWO MODES
 ------------------------------------------------------------------------------
 """
 import os
+import re
 import sys
 
 import pytest
@@ -47,10 +48,31 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 
+# Matches the `live` marker token, capturing a preceding `not` if there
+# is one. A plain substring test is not enough: `pytest -m "not live"` is
+# a perfectly ordinary way to ask for the stubbed suite, and reading it
+# as a live run would demand python3-samba to run tests that explicitly
+# excluded it.
+_LIVE_TOKEN = re.compile(r'(?P<negated>\bnot\s+)?\blive\b')
+
+
+def marker_selects_live(expr):
+    """
+    True when a -m expression asks for live tests.
+
+    Deliberately conservative: any unnegated `live` token counts, so
+    'live', 'live or slow' and 'slow and live' all select live, while
+    '', 'not live' and 'slow and not live' do not.
+    """
+    return any(
+        match.group('negated') is None
+        for match in _LIVE_TOKEN.finditer(expr or '')
+    )
+
+
 def _want_live(config):
     """True when the run was explicitly asked for live tests."""
-    expr = config.getoption('-m', default='') or ''
-    return 'live' in expr
+    return marker_selects_live(config.getoption('-m', default='') or '')
 
 
 def _install_stubs():
