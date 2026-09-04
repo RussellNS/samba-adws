@@ -156,6 +156,62 @@ def test_object_class_not_rendered_unless_requested(sambautils, recording):
     assert 'objectClass' not in rendered
 
 
+def test_object_class_is_rendered_with_a_real_syntax_name_when_requested(
+        sambautils, recording):
+    """
+    Direct regression test for the confirmed live failure (2026-09-04):
+    Get-ADObject's default property set explicitly requests objectClass,
+    and a live capture showed it rendered as
+    <addata:objectClass LdapSyntax="1.3.6.1.4.1.1466.115.121.1.15">
+    -- the literal fallback OID string, because SYNTAX_OBJECT_IDENTIFIER
+    (objectClass's real syntax) collided with two other constants and
+    was unreachable. This is what broke Get-ADObject end to end: the
+    proxy sent every response, but the client rejected them, retried
+    identically, and reported ADServerDownException.
+
+    Deliberately does NOT use SYNTAXES / add_syntax() for objectClass,
+    to mirror the live behaviour: the schema lookup resolves objectClass
+    to sambautils.SYNTAX_OBJECT_IDENTIFIER, and it is on the production
+    syntax registry -- not a test fixture -- that this now depends.
+    """
+    rec = recording()
+    rec.add_syntax({
+        'sAMAccountName': sambautils.SYNTAX_DIRECTORY_STRING,
+        'cn': sambautils.SYNTAX_DIRECTORY_STRING,
+        'objectClass': sambautils.SYNTAX_OBJECT_IDENTIFIER,
+    })
+    rec.add_search(
+        [('CN=alice,' + DOMAIN_DN, {
+            'sAMAccountName': [b'alice'],
+            'cn': [b'alice'],
+            'objectClass': [b'top', b'user'],
+            'userAccountControl': [b'512'],
+            'primaryGroupID': [b'513'],
+        })],
+        base=DOMAIN_DN, scope=ldb.SCOPE_SUBTREE,
+        expression='(objectClass=user)',
+        # render_pull() always appends DC_QUAL_ATTRS to the fetch list,
+        # even when objectClass is explicitly requested.
+        attrs=['sAMAccountName', 'cn', 'objectClass',
+               'userAccountControl', 'primaryGroupID'],
+    )
+
+    context = base_context(
+        SelectionProperty_List=[
+            'addata:sAMAccountName', 'addata:cn', 'addata:objectClass'])
+    root = parse(render(sambautils, rec, context))
+
+    object_class_elem = list(items(root))[0].find(
+        'addata:objectClass', NSMAP)
+    ldap_syntax = object_class_elem.get('LdapSyntax')
+
+    assert ldap_syntax == 'ObjectIdentifier', (
+        "objectClass rendered with LdapSyntax=%r -- this is the exact "
+        "value (a raw OID string) that a live capture showed the AD "
+        "PowerShell client rejecting." % ldap_syntax
+    )
+
+
 # ========================================================================== #
 # Wildcard handling (change log v1.1.3)                                      #
 # ========================================================================== #

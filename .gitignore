@@ -108,3 +108,7 @@ tags
 # Test harness
 .pytest_cache/
 .venv/
+
+# Scratch landing spot for `docker cp`'d ADWS_RECORD_DIR captures --
+# copy what's needed into tests/fixtures/ instead of committing this.
+/adws-schema-capture/

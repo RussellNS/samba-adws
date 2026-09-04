@@ -4,7 +4,7 @@ Script Name:      record.py
 Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2026-09-03
-Script Version:   1.0.0
+Script Version:   1.1.0
 Script Purpose:   Optional recording layer for the ADWS proxy. When
                   enabled, captures every LDB call the proxy makes --
                   arguments and results -- so those exchanges can be
@@ -31,14 +31,29 @@ Script Desc:      Recording is OFF unless the ADWS_RECORD_DIR environment
 
                   Output layout under ADWS_RECORD_DIR:
 
+                    .session      sentinel; presence means this
+                                  directory already holds a capture
                     calls.jsonl   one JSON object per LDB call
                     <n>.xml       SOAP exchange n -- the decoded request
                                   followed by the rendered response
                                   (written by xmlutils.print_xml)
 
-                  calls.jsonl is append-only and each record carries the
-                  exchange index it belongs to, so LDB traffic can be
-                  correlated with the SOAP request that provoked it.
+                  calls.jsonl is append-only within one capture session
+                  and each record carries the exchange index it belongs
+                  to, so LDB traffic can be correlated with the SOAP
+                  request that provoked it. main.py is a
+                  ForkingTCPServer, so a single cmdlet routinely opens
+                  several overlapping connections (one per ADWS
+                  endpoint it touches) and this module runs once per
+                  connection, in a separate forked process each time.
+                  The .session sentinel is what keeps that from
+                  truncating calls.jsonl on every connection instead of
+                  once per session -- see SamDBRecorder.__init__.
+
+                  To start a NEW capture (discarding the old one),
+                  remove the whole directory first:
+
+                    rm -rf /tmp/rec
 
 Script Desc:      Values returned by LDB are arbitrary bytes (SIDs, GUIDs,
                   security descriptors). The base64 encoding used in the
@@ -138,8 +153,37 @@ class SamDBRecorder(object):
         object.__setattr__(
             self, '_path', os.path.join(record_dir, 'calls.jsonl'))
 
-        # Truncate on start so each capture session is self-contained.
-        with open(self._path, 'w'):
+        # Truncate calls.jsonl exactly once per capture session, not
+        # once per connection.
+        #
+        # main.py is a ForkingTCPServer: every connection runs handle()
+        # in a freshly forked child process, and each child constructs
+        # its own SamDBHelper and wraps it here -- so __init__ runs once
+        # PER CONNECTION, in a separate process each time, with no
+        # shared in-memory state to say "this is not the first one."
+        # A plain `open(path, 'w')` here truncates on every connection,
+        # so with several overlapping connections (normal for an
+        # AD PowerShell cmdlet, which opens parallel connections to
+        # /Windows/Resource and /Windows/Enumeration) each new one wipes
+        # out whatever the previous one had written -- confirmed live,
+        # 2026-09-04: a four-connection capture came back with a 0-byte
+        # calls.jsonl because the last connection to construct a
+        # recorder truncated the file and then never got far enough to
+        # write anything before being reset.
+        #
+        # A sentinel file created with O_CREAT | O_EXCL is atomic across
+        # processes at the OS level: exactly one connection's open()
+        # call can win the race and see the file not yet exist, so
+        # exactly one connection truncates calls.jsonl. Every other
+        # connection -- concurrent or later -- gets FileExistsError and
+        # appends instead.
+        sentinel = os.path.join(record_dir, '.session')
+        try:
+            fd = os.open(sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            with open(self._path, 'w'):
+                pass
+        except FileExistsError:
             pass
         log.info('ADWS recording enabled -> %s', record_dir)
 

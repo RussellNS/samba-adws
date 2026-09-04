@@ -1,0 +1,49 @@
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:addata="http://schemas.microsoft.com/2008/1/ActiveDirectory/Data" xmlns:ad="http://schemas.microsoft.com/2008/1/ActiveDirectory" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+ <s:Header>
+  <a:Action s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2004/09/enumeration/Enumerate</a:Action>
+  <ad:instance>ldap:9389</ad:instance>
+  <a:MessageID>urn:uuid:5e75bd0e-4ed8-4057-98b8-11f9feef11ff</a:MessageID>
+  <a:ReplyTo>
+   <a:Address>http://www.w3.org/2005/08/addressing/anonymous</a:Address>
+  </a:ReplyTo>
+  <a:To s:mustUnderstand="1">net.tcp://dc1.vlab.test:9389/ActiveDirectoryWebServices/Windows/Enumeration</a:To>
+ </s:Header>
+ <s:Body xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration" xmlns:adlq="http://schemas.microsoft.com/2008/1/ActiveDirectory/Dialect/LdapQuery">
+  <wsen:Enumerate>
+   <wsen:Filter Dialect="http://schemas.microsoft.com/2008/1/ActiveDirectory/Dialect/LdapQuery">
+    <adlq:LdapQuery>
+     <adlq:Filter>(objectClass=attributeSchema)</adlq:Filter>
+     <adlq:BaseObject>CN=Schema,CN=Configuration,DC=vlab,DC=test</adlq:BaseObject>
+     <adlq:Scope>Subtree</adlq:Scope>
+    </adlq:LdapQuery>
+   </wsen:Filter>
+   <ad:Selection Dialect="http://schemas.microsoft.com/2008/1/ActiveDirectory/Dialect/XPath-Level-1">
+    <ad:SelectionProperty>ad:distinguishedName</ad:SelectionProperty>
+    <ad:SelectionProperty>addata:name</ad:SelectionProperty>
+    <ad:SelectionProperty>addata:objectClass</ad:SelectionProperty>
+    <ad:SelectionProperty>addata:objectGUID</ad:SelectionProperty>
+   </ad:Selection>
+  </wsen:Enumerate>
+ </s:Body>
+</s:Envelope>
+
+
+<s:Envelope
+    xmlns:a="http://www.w3.org/2005/08/addressing" 
+    xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+    <s:Header>
+        <a:Action s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2004/09/enumeration/EnumerateResponse</a:Action>
+        <a:RelatesTo>urn:uuid:5e75bd0e-4ed8-4057-98b8-11f9feef11ff</a:RelatesTo>
+    </s:Header>
+    <s:Body>
+        <wsen:EnumerateResponse
+            xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+            xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+            <wsen:Expires>2018-10-18T01:10:14.5239878Z</wsen:Expires>
+            <wsen:EnumerationContext>dfeaf9de-a875-11f1-8e87-02420a0a0a0b</wsen:EnumerationContext>
+        </wsen:EnumerateResponse>
+    </s:Body>
+</s:Envelope>
+
+

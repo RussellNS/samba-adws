@@ -8,6 +8,17 @@ python3-samba and fail when they drift.
 If one of these fails, the fix is to correct tests/stubs/ -- NOT to
 weaken the assertion. A stub that disagrees with reality turns every
 other passing test into a false negative.
+
+NOTE on the SYNTAX_* checks below: as of the 2026-09-04 syntax-registry
+fix, sambautils.py no longer sources these from the `ldb` module at all
+-- see tests/test_syntax_registry.py for why (a live capture showed the
+old getattr(ldb, NAME, 1) approach silently mis-annotating objectClass
+on every object in a Get-ADObject response, which broke the cmdlet
+outright). These EXPECTED_PRESENT/EXPECTED_ABSENT checks are therefore
+no longer guarding production correctness -- they only document the
+real ldb module's shape, for whoever next writes a stub or fixture
+against it. tests/stubs/ldb.py's own SYNTAX_* constants remain for
+fixture-authoring convenience in the other test files.
 """
 import importlib
 

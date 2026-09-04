@@ -4,8 +4,8 @@ Script Name:      sambautils.py
 Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
-Script Modified:  2026-Jun-15
-Script Version:   1.1.14
+Script Modified:  2026-Sep-04
+Script Version:   1.1.15
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -166,6 +166,27 @@ Change Log:
            same as fetch_all: pass attrs=None to LDB and an empty list
            to build_attr_list() so all real attributes are returned
            but internal fields are filtered out by the schema lookup.
+  1.1.15 - Fix LDAP syntax OID registry collision that broke
+           Get-ADObject outright. The nine SYNTAX_* constants were
+           sourced via getattr(ldb, 'SYNTAX_X', 1); python3-ldb does
+           not export SYNTAX_LARGE_INTEGER, SYNTAX_OBJECT_IDENTIFIER or
+           SYNTAX_GENERALIZED_TIME (confirmed against a live container,
+           2026-09-04), so all three silently collided on the fallback
+           value 1 in OID_SCHEMA_SYNTAX_DICT. objectClass's real syntax
+           is Object Identifier, and objectClass is in Get-ADObject's
+           default property set; a live capture showed every object in
+           a Pull response rendering
+           <addata:objectClass LdapSyntax="1.3.6.1.4.1.1466.115.121.1.15">
+           -- the unknown-attribute fallback's literal OID string,
+           reached because the real syntax was unregistered. The AD
+           PowerShell client silently rejected every response, retried
+           identically, and reported ADServerDownException. Fixed by
+           hardcoding all nine syntax OIDs as literals (they are RFC
+           4517 / MS-ADTS protocol constants, not Samba version
+           details, so there was never a good reason to source them
+           from the `ldb` module) and by changing the unknown-attribute
+           fallback to emit the name 'UnicodeString' instead of an OID
+           string, matching every other registry entry.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -189,25 +210,47 @@ from base64 import b64encode
 
 
 # ========================================================================== #
-# ldb Constant Polyfill                                                      #
+# LDAP Syntax OID Constants                                                  #
 # ========================================================================== #
-# The python3-ldb package does not consistently expose OID constants
-# across all Samba versions. getattr() with a fallback prevents
-# AttributeErrors at import time on systems where a constant is missing.
-# The fallback value of 1 is a placeholder; if a constant is genuinely
-# absent it means the installed Samba version does not support that
-# syntax, which will surface as a missing syntax lookup rather than a
-# hard crash.
+# These are RFC 4517 standard syntax OIDs (SYNTAX_LARGE_INTEGER is the
+# one Microsoft-specific exception -- AD's Integer8/LargeInteger syntax,
+# MS-ADTS 3.1.1.2.3). They are protocol constants, not Samba
+# implementation details, so they are hardcoded here directly rather
+# than sourced from the `ldb` module.
+#
+# CHANGE LOG NOTE (formerly a getattr(ldb, NAME, 1) polyfill):
+# This used to read these values off the `ldb` module via
+# getattr(ldb, 'SYNTAX_X', 1), on the theory that python3-ldb might not
+# expose every constant on every Samba version. In practice python3-ldb
+# does not expose SYNTAX_LARGE_INTEGER, SYNTAX_OBJECT_IDENTIFIER or
+# SYNTAX_GENERALIZED_TIME AT ALL (confirmed live, 2026-09-04, against
+# Samba/python3-ldb on Python 3.13.5) -- so all three silently fell back
+# to the same placeholder value of 1 and collided in
+# OID_SCHEMA_SYNTAX_DICT, which is keyed by this value. Only the last
+# of the three defined in SCHEMA_SYNTAX_LIST was ever reachable.
+#
+# objectClass's real LDAP syntax IS Object Identifier, and objectClass
+# is in the default property set of Get-ADObject, so this collision put
+# an unresolvable syntax on the single most fundamental AD attribute.
+# build_attr_list()'s fallback for an unresolvable syntax renders the
+# literal fallback OID string as the LdapSyntax value instead of a name
+# -- confirmed via a live capture to render
+# <addata:objectClass LdapSyntax="1.3.6.1.4.1.1466.115.121.1.15">
+# on every object in a Pull response, which is not a well-known token
+# the AD PowerShell client's WCF deserializer recognises. That is the
+# confirmed cause of Get-ADObject returning ADServerDownException
+# against a live DC: the proxy sent a response every time, but the
+# client rejected it, retried identically, and gave up.
 
-SYNTAX_INTEGER           = getattr(ldb, 'SYNTAX_INTEGER',           1)
-SYNTAX_LARGE_INTEGER     = getattr(ldb, 'SYNTAX_LARGE_INTEGER',     1)
-SYNTAX_BOOLEAN           = getattr(ldb, 'SYNTAX_BOOLEAN',           1)
-SYNTAX_DIRECTORY_STRING  = getattr(ldb, 'SYNTAX_DIRECTORY_STRING',  1)
-SYNTAX_OCTET_STRING      = getattr(ldb, 'SYNTAX_OCTET_STRING',      1)
-SYNTAX_DN                = getattr(ldb, 'SYNTAX_DN',                1)
-SYNTAX_UTC_TIME          = getattr(ldb, 'SYNTAX_UTC_TIME',          1)
-SYNTAX_GENERALIZED_TIME  = getattr(ldb, 'SYNTAX_GENERALIZED_TIME',  1)
-SYNTAX_OBJECT_IDENTIFIER = getattr(ldb, 'SYNTAX_OBJECT_IDENTIFIER', 1)
+SYNTAX_INTEGER           = '1.3.6.1.4.1.1466.115.121.1.27'
+SYNTAX_LARGE_INTEGER     = '1.2.840.113556.1.4.906'
+SYNTAX_BOOLEAN           = '1.3.6.1.4.1.1466.115.121.1.7'
+SYNTAX_DIRECTORY_STRING  = '1.3.6.1.4.1.1466.115.121.1.15'
+SYNTAX_OCTET_STRING      = '1.3.6.1.4.1.1466.115.121.1.40'
+SYNTAX_DN                = '1.3.6.1.4.1.1466.115.121.1.12'
+SYNTAX_UTC_TIME          = '1.3.6.1.4.1.1466.115.121.1.53'
+SYNTAX_GENERALIZED_TIME  = '1.3.6.1.4.1.1466.115.121.1.24'
+SYNTAX_OBJECT_IDENTIFIER = '1.3.6.1.4.1.1466.115.121.1.38'
 
 
 
@@ -704,9 +747,18 @@ class SamDBHelper(SamDB):
                     # our registry (e.g. schema extensions or
                     # Samba-specific attrs). Treat as plain Unicode
                     # strings, which is correct for most unknown attrs.
+                    #
+                    # ldap_syntax must be the NAME ('UnicodeString'), not
+                    # the OID -- this field is confirmed (via a live
+                    # capture, 2026-09-04) to reach the AD PowerShell
+                    # client's WCF deserializer verbatim as the
+                    # LdapSyntax XML attribute. A prior version of this
+                    # fallback used the OID string here by mistake,
+                    # which is what made objectClass unrenderable before
+                    # SYNTAX_OBJECT_IDENTIFIER was registered above.
                     if not syntax:
                         syntax = type('Syntax', (), {
-                            'ldap_syntax': '1.3.6.1.4.1.1466.115.121.1.15',
+                            'ldap_syntax': 'UnicodeString',
                             'xsi_type':    'xsd:string'
                         })
 

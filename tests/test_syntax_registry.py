@@ -1,21 +1,34 @@
 """
 The LDAP-syntax registry in sambautils.
 
-sambautils wraps every ldb syntax constant in getattr(ldb, NAME, 1),
-because python3-ldb does not export all of them. Any constant that falls
-back collides with every other constant that falls back, since they all
-become the integer 1 and OID_SCHEMA_SYNTAX_DICT is keyed by that value.
+FIXED 2026-09-04. This registry used to be built via
+getattr(ldb, 'SYNTAX_X', 1), on the theory that python3-ldb might not
+export every constant on every Samba version. In practice it never
+exports SYNTAX_LARGE_INTEGER, SYNTAX_OBJECT_IDENTIFIER or
+SYNTAX_GENERALIZED_TIME -- confirmed live, 2026-09-04 -- so all three
+fell back to the same value and collided in OID_SCHEMA_SYNTAX_DICT.
 
-CONFIRMED against a live container (2026-09-04): SYNTAX_GENERALIZED_TIME
-is one of the missing constants, alongside the previously-assumed
-SYNTAX_LARGE_INTEGER and SYNTAX_OBJECT_IDENTIFIER -- three-way collision,
-not two. See tests/stubs/ldb.py for the up-to-date absent-constant list
-and tests/test_stub_fidelity.py for what confirms it.
+That collision was not academic: objectClass's real LDAP syntax is
+Object Identifier, objectClass is in Get-ADObject's default property
+set, and a live capture showed the collision rendering
+<addata:objectClass LdapSyntax="1.3.6.1.4.1.1466.115.121.1.15"> on
+every object in the response -- a value the AD PowerShell client's WCF
+deserializer does not recognise. That is a confirmed, reproduced cause
+of Get-ADObject returning ADServerDownException against a live DC: the
+proxy sent a response every time, the client silently rejected it,
+retried identically, and gave up.
 
-These tests pin the current behaviour so a future fix is a visible,
-deliberate change rather than an accident.
+The fix hardcodes all nine syntax OIDs as literals in sambautils.py --
+they are RFC 4517 (and one MS-ADTS) protocol constants, not Samba
+implementation details, so there is no reason to source them from the
+`ldb` module at all. sambautils.py no longer touches ldb.SYNTAX_* for
+anything. tests/stubs/ldb.py's own SYNTAX_* constants remain, but only
+as fixture-authoring convenience values for these tests -- they are not
+load-bearing for production correctness any more, unlike before this
+fix. See tests/test_stub_fidelity.py for what still depends on the
+real ldb module's shape.
 """
-import pytest
+import ldb
 
 
 def test_registry_is_keyed_by_oid(sambautils):
@@ -23,68 +36,82 @@ def test_registry_is_keyed_by_oid(sambautils):
         assert syntax.oid == oid
 
 
-def test_known_syntaxes_resolve(sambautils):
-    """The syntaxes python3-ldb does export must round-trip cleanly."""
-    import ldb
+def test_registry_has_no_duplicate_oids(sambautils):
+    """
+    Regression guard for the fix: nine distinct constants must produce
+    nine distinct dict entries. Before the fix this was 7 (three
+    constants collided down to one).
+    """
+    oids = [s.oid for s in sambautils.SCHEMA_SYNTAX_LIST]
+    assert len(oids) == len(set(oids)), (
+        'SCHEMA_SYNTAX_LIST has colliding OIDs: %r' % oids
+    )
+    assert len(sambautils.OID_SCHEMA_SYNTAX_DICT) == len(oids)
+
+
+def test_all_nine_syntaxes_resolve(sambautils):
+    """Every declared syntax must be independently reachable by OID."""
     expected = {
-        ldb.SYNTAX_DIRECTORY_STRING: 'UnicodeString',
-        ldb.SYNTAX_INTEGER: 'Integer',
-        ldb.SYNTAX_BOOLEAN: 'Boolean',
-        ldb.SYNTAX_OCTET_STRING: 'OctetString',
-        ldb.SYNTAX_DN: 'DSDNString',
-        ldb.SYNTAX_UTC_TIME: 'UTCTimeString',
+        sambautils.SYNTAX_INTEGER: 'Integer',
+        sambautils.SYNTAX_LARGE_INTEGER: 'LargeInteger',
+        sambautils.SYNTAX_BOOLEAN: 'Boolean',
+        sambautils.SYNTAX_DIRECTORY_STRING: 'UnicodeString',
+        sambautils.SYNTAX_OCTET_STRING: 'OctetString',
+        sambautils.SYNTAX_DN: 'DSDNString',
+        sambautils.SYNTAX_UTC_TIME: 'UTCTimeString',
+        sambautils.SYNTAX_GENERALIZED_TIME: 'GeneralizedTimeString',
+        sambautils.SYNTAX_OBJECT_IDENTIFIER: 'ObjectIdentifier',
     }
     for oid, name in expected.items():
         assert sambautils.OID_SCHEMA_SYNTAX_DICT[oid].ldap_syntax == name
 
 
+def test_object_identifier_syntax_is_correct(sambautils):
+    """
+    Direct regression test for the confirmed failure: objectClass's
+    real syntax (Object Identifier) must resolve to the name
+    'ObjectIdentifier', not collide with LargeInteger or
+    GeneralizedTimeString, and not fall back to 1.
+    """
+    assert sambautils.SYNTAX_OBJECT_IDENTIFIER != 1
+    assert sambautils.SYNTAX_OBJECT_IDENTIFIER != sambautils.SYNTAX_LARGE_INTEGER
+    assert sambautils.SYNTAX_OBJECT_IDENTIFIER != sambautils.SYNTAX_GENERALIZED_TIME
+
+    syntax = sambautils.OID_SCHEMA_SYNTAX_DICT[sambautils.SYNTAX_OBJECT_IDENTIFIER]
+    assert syntax.ldap_syntax == 'ObjectIdentifier'
+
+
 def test_octet_string_is_base64_typed(sambautils):
-    import ldb
-    syntax = sambautils.OID_SCHEMA_SYNTAX_DICT[ldb.SYNTAX_OCTET_STRING]
+    syntax = sambautils.OID_SCHEMA_SYNTAX_DICT[sambautils.SYNTAX_OCTET_STRING]
     assert syntax.xsi_type == 'xsd:base64Binary'
 
 
-def test_fallback_constants_collide(sambautils):
+def test_syntax_constants_no_longer_depend_on_ldb_module(sambautils):
     """
-    Documents the getattr(..., 1) collision.
-
-    SYNTAX_LARGE_INTEGER, SYNTAX_OBJECT_IDENTIFIER and
-    SYNTAX_GENERALIZED_TIME all fall back to 1, so the registry holds
-    only the last one defined in SCHEMA_SYNTAX_LIST. That means
-    LargeInteger attributes (pwdLastSet, lastLogonTimestamp,
-    accountExpires -- all extremely common under -Properties *) AND
-    GeneralizedTime attributes (whenCreated, whenChanged) are both
-    annotated as ObjectIdentifier.
-
-    This test asserts the CURRENT (wrong) behaviour on purpose. When the
-    syntax registry is fixed in the Tier 3 work, this test should fail
-    and be rewritten to assert the correct mapping.
+    The whole point of the fix: these are literal OID strings now, not
+    values fished out of the `ldb` module. Deleting every SYNTAX_*
+    export from tests/stubs/ldb.py should not change any of them.
     """
-    assert sambautils.SYNTAX_LARGE_INTEGER == 1
-    assert sambautils.SYNTAX_OBJECT_IDENTIFIER == 1
-    assert sambautils.SYNTAX_GENERALIZED_TIME == 1
-    assert sambautils.OID_SCHEMA_SYNTAX_DICT[1].ldap_syntax == 'ObjectIdentifier'
-
-    names = [s.ldap_syntax for s in sambautils.SCHEMA_SYNTAX_LIST]
-    assert 'LargeInteger' in names, 'LargeInteger is declared...'
-    assert 'GeneralizedTimeString' in names, \
-        'GeneralizedTimeString is declared...'
-    assert not any(
-        s.ldap_syntax in ('LargeInteger', 'GeneralizedTimeString')
-        for s in sambautils.OID_SCHEMA_SYNTAX_DICT.values()
-    ), '...but neither is reachable through the OID registry'
+    for name in ('SYNTAX_INTEGER', 'SYNTAX_LARGE_INTEGER', 'SYNTAX_BOOLEAN',
+                 'SYNTAX_DIRECTORY_STRING', 'SYNTAX_OCTET_STRING',
+                 'SYNTAX_DN', 'SYNTAX_UTC_TIME', 'SYNTAX_GENERALIZED_TIME',
+                 'SYNTAX_OBJECT_IDENTIFIER'):
+        value = getattr(sambautils, name)
+        assert isinstance(value, str) and value.count('.') >= 5, (
+            '%s = %r does not look like a literal OID string' % (name, value)
+        )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='The build_attr_list fallback sets ldap_syntax to the literal OID '
-           '1.3.6.1.4.1.1466.115.121.1.15, but every real entry uses a NAME '
-           '(UnicodeString). Windows expects the name, so unknown attributes '
-           'are annotated in a format the client does not understand.',
-)
 def test_unknown_attribute_fallback_uses_syntax_name(sambautils, recording):
+    """
+    Regression test for the second half of the fix: an attribute whose
+    syntax truly cannot be resolved (not just objectClass, which is now
+    fixed by registering Object Identifier -- this is a genuinely
+    unknown/custom attribute) must fall back to the NAME
+    'UnicodeString', not the OID string that used to be hardcoded here
+    by mistake.
+    """
     from tests import replay
-    import ldb
 
     rec = recording()
     # No add_syntax() call, so the schema lookup returns None and
