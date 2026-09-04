@@ -93,15 +93,22 @@ SCOPE_SUBTREE  = 2
 # OID_SCHEMA_SYNTAX_DICT while the real DC builds a smaller one -- and
 # the tests would pass on a registry that does not exist in production.
 #
-# So: SYNTAX_LARGE_INTEGER and SYNTAX_OBJECT_IDENTIFIER are INTENTIONALLY
-# ABSENT. Both fall back to the literal 1 in sambautils, collide on the
-# same dict key, and the later entry wins. test_syntax_registry.py
+# So: SYNTAX_LARGE_INTEGER, SYNTAX_OBJECT_IDENTIFIER and
+# SYNTAX_GENERALIZED_TIME are INTENTIONALLY ABSENT. All three fall back
+# to the literal 1 in sambautils, collide on the same dict key, and the
+# last one defined in SCHEMA_SYNTAX_LIST wins. test_syntax_registry.py
 # documents the resulting behaviour.
 #
-# The absent-constant list is this author's reading of the python3-ldb
-# bindings and has NOT been verified against a live Samba install.
-# test_stub_fidelity.py (marked `live`) is what settles it -- run the
-# suite inside the container to confirm or correct this table.
+# CONFIRMED against a live container (2026-09-04, Samba/python3-ldb on
+# Python 3.13.5): SYNTAX_GENERALIZED_TIME does not exist on the real
+# `ldb` module -- test_stub_fidelity.py caught this stub being wrong
+# about it. SYNTAX_LARGE_INTEGER and SYNTAX_OBJECT_IDENTIFIER were
+# already excluded here and have NOT yet been independently confirmed
+# absent (the live run before this fix asserted the wrong set of
+# "present" names and never checked them). Both are still treated as
+# absent below on the pre-existing reasoning; test_stub_fidelity.py now
+# checks all three explicitly on every live run so a wrong guess here
+# cannot survive silently again.
 
 SYNTAX_DIRECTORY_STRING  = "1.3.6.1.4.1.1466.115.121.1.15"
 SYNTAX_INTEGER           = "1.3.6.1.4.1.1466.115.121.1.27"
@@ -109,10 +116,10 @@ SYNTAX_BOOLEAN           = "1.3.6.1.4.1.1466.115.121.1.7"
 SYNTAX_OCTET_STRING      = "1.3.6.1.4.1.1466.115.121.1.40"
 SYNTAX_DN                = "1.3.6.1.4.1.1466.115.121.1.12"
 SYNTAX_UTC_TIME          = "1.3.6.1.4.1.1466.115.121.1.53"
-SYNTAX_GENERALIZED_TIME  = "1.3.6.1.4.1.1466.115.121.1.24"
 
-# SYNTAX_LARGE_INTEGER     -- intentionally not defined (see above)
-# SYNTAX_OBJECT_IDENTIFIER -- intentionally not defined (see above)
+# SYNTAX_GENERALIZED_TIME -- intentionally not defined; CONFIRMED absent
+# SYNTAX_LARGE_INTEGER    -- intentionally not defined; NOT yet confirmed
+# SYNTAX_OBJECT_IDENTIFIER -- intentionally not defined; NOT yet confirmed
 
 
 # ========================================================================== #

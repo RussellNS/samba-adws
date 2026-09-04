@@ -6,6 +6,12 @@ because python3-ldb does not export all of them. Any constant that falls
 back collides with every other constant that falls back, since they all
 become the integer 1 and OID_SCHEMA_SYNTAX_DICT is keyed by that value.
 
+CONFIRMED against a live container (2026-09-04): SYNTAX_GENERALIZED_TIME
+is one of the missing constants, alongside the previously-assumed
+SYNTAX_LARGE_INTEGER and SYNTAX_OBJECT_IDENTIFIER -- three-way collision,
+not two. See tests/stubs/ldb.py for the up-to-date absent-constant list
+and tests/test_stub_fidelity.py for what confirms it.
+
 These tests pin the current behaviour so a future fix is a visible,
 deliberate change rather than an accident.
 """
@@ -27,7 +33,6 @@ def test_known_syntaxes_resolve(sambautils):
         ldb.SYNTAX_OCTET_STRING: 'OctetString',
         ldb.SYNTAX_DN: 'DSDNString',
         ldb.SYNTAX_UTC_TIME: 'UTCTimeString',
-        ldb.SYNTAX_GENERALIZED_TIME: 'GeneralizedTimeString',
     }
     for oid, name in expected.items():
         assert sambautils.OID_SCHEMA_SYNTAX_DICT[oid].ldap_syntax == name
@@ -43,11 +48,13 @@ def test_fallback_constants_collide(sambautils):
     """
     Documents the getattr(..., 1) collision.
 
-    SYNTAX_LARGE_INTEGER and SYNTAX_OBJECT_IDENTIFIER both fall back to
-    1, so the registry holds only the last one defined in
-    SCHEMA_SYNTAX_LIST. That means LargeInteger attributes --
-    pwdLastSet, lastLogonTimestamp, accountExpires, all extremely
-    common under -Properties * -- are annotated as ObjectIdentifier.
+    SYNTAX_LARGE_INTEGER, SYNTAX_OBJECT_IDENTIFIER and
+    SYNTAX_GENERALIZED_TIME all fall back to 1, so the registry holds
+    only the last one defined in SCHEMA_SYNTAX_LIST. That means
+    LargeInteger attributes (pwdLastSet, lastLogonTimestamp,
+    accountExpires -- all extremely common under -Properties *) AND
+    GeneralizedTime attributes (whenCreated, whenChanged) are both
+    annotated as ObjectIdentifier.
 
     This test asserts the CURRENT (wrong) behaviour on purpose. When the
     syntax registry is fixed in the Tier 3 work, this test should fail
@@ -55,14 +62,17 @@ def test_fallback_constants_collide(sambautils):
     """
     assert sambautils.SYNTAX_LARGE_INTEGER == 1
     assert sambautils.SYNTAX_OBJECT_IDENTIFIER == 1
+    assert sambautils.SYNTAX_GENERALIZED_TIME == 1
     assert sambautils.OID_SCHEMA_SYNTAX_DICT[1].ldap_syntax == 'ObjectIdentifier'
 
     names = [s.ldap_syntax for s in sambautils.SCHEMA_SYNTAX_LIST]
     assert 'LargeInteger' in names, 'LargeInteger is declared...'
+    assert 'GeneralizedTimeString' in names, \
+        'GeneralizedTimeString is declared...'
     assert not any(
-        s.ldap_syntax == 'LargeInteger'
+        s.ldap_syntax in ('LargeInteger', 'GeneralizedTimeString')
         for s in sambautils.OID_SCHEMA_SYNTAX_DICT.values()
-    ), '...but is unreachable through the OID registry'
+    ), '...but neither is reachable through the OID registry'
 
 
 @pytest.mark.xfail(

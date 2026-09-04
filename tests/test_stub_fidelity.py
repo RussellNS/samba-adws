@@ -20,16 +20,22 @@ EXPECTED_PRESENT = [
     'SCOPE_BASE', 'SCOPE_ONELEVEL', 'SCOPE_SUBTREE',
     'SYNTAX_DIRECTORY_STRING', 'SYNTAX_INTEGER', 'SYNTAX_BOOLEAN',
     'SYNTAX_OCTET_STRING', 'SYNTAX_DN', 'SYNTAX_UTC_TIME',
-    'SYNTAX_GENERALIZED_TIME',
 ]
 
 # Names tests/stubs/ldb.py asserts python3-ldb does NOT export. If one of
 # these starts existing, the syntax-registry collision documented in
 # test_syntax_registry.py has partly resolved itself and that test needs
 # revisiting.
+#
+# SYNTAX_GENERALIZED_TIME's absence was CONFIRMED live on 2026-09-04
+# (this file previously listed it under EXPECTED_PRESENT by mistake,
+# which is exactly the failure mode this suite exists to catch).
+# SYNTAX_LARGE_INTEGER and SYNTAX_OBJECT_IDENTIFIER are unconfirmed --
+# carried over from the original (unverified) reading of the bindings.
 EXPECTED_ABSENT = [
     'SYNTAX_LARGE_INTEGER',
     'SYNTAX_OBJECT_IDENTIFIER',
+    'SYNTAX_GENERALIZED_TIME',
 ]
 
 
@@ -146,8 +152,28 @@ def test_result_msgs_is_read_only():
     """
     Regression guard for sambautils change log v1.1.8, which was caused
     by assuming result.msgs was assignable.
+
+    ldb.Result is a C extension type that cannot be constructed
+    directly (ldb.Result() raises TypeError: cannot create 'ldb.Result'
+    instances -- confirmed live on 2026-09-04, this test's first version
+    tried exactly that and failed for the wrong reason). A real instance
+    can only be obtained from search(), so get one that way.
     """
     import ldb
-    result = ldb.Result()
+
+    try:
+        from samba.param import LoadParm
+        lp = LoadParm()
+        lp.load_default()
+    except Exception:
+        pytest.skip('no smb.conf available to open a real SamDB')
+
+    from samba.auth import system_session
+    from samba.samdb import SamDB
+
+    samdb = SamDB(lp=lp, session_info=system_session())
+    result = samdb.search(
+        base=samdb.domain_dn(), scope=ldb.SCOPE_BASE, attrs=['objectClass'])
+
     with pytest.raises((AttributeError, TypeError)):
         result.msgs = []
