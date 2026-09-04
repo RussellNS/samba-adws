@@ -17,6 +17,7 @@ from wcf.records import dump_records
 from adws import sambautils
 from adws import xmlutils
 from adws import record
+from adws import debug_cap
 
 # --- Logging Configuration ---
 LOG_FORMAT = ('%(levelname)-10s %(asctime)s pid:%(process)d '
@@ -316,6 +317,11 @@ def main():
     parser.add_argument('-b', '--bind', default='localhost')
     parser.add_argument('-p', '--port', type=int, default=9389)
     args = parser.parse_args()
+
+    # Bisection tooling for the message size ceiling investigation.
+    # Inert unless ADWS_DEBUG_MAX_ATTR_VALUES is set. See
+    # adws/debug_cap.py -- this is temporary, not a fix.
+    debug_cap.enable_if_configured()
 
     # Initialize the NMF record type registry
     nmf.register_types()
