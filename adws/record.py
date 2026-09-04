@@ -5,7 +5,7 @@ Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2026-09-03
 Script Modified:  2026-09-04
-Script Version:   1.2.0
+Script Version:   1.2.1
 Script Purpose:   Optional recording layer for the ADWS proxy. When
                   enabled, captures every LDB call the proxy makes,
                   arguments and results, so those exchanges can be
@@ -99,6 +99,13 @@ Change Log:
             since every LDB call in sambautils.py is made as
             self.search(...) from inside a render_* method, where
             self is the original unwrapped helper.
+  1.2.1 - Fixed a crash the recorder itself introduced. The search
+            wrapper declared named parameters with None defaults,
+            which turned an omitted scope argument into an explicit
+            scope=None on the forwarded call and crashed a request
+            the recorder was only supposed to be observing. All
+            wrapped methods now forward *args and **kwargs exactly
+            as received instead of re-declaring a signature.
 ------------------------------------------------------------------------------
 """
 import json
@@ -264,22 +271,33 @@ def _make_search_wrapper(session, original):
     Build a replacement for helper.search that logs its call through
     session before delegating to the real, unpatched search() bound
     method captured in original.
+
+    Forwards *args and **kwargs exactly as received, rather than
+    re-declaring named parameters with None defaults. Confirmed live,
+    2026-09-04: render_transfer_get() calls self.search(base=...,
+    attrs=..., controls=[]), deliberately omitting scope so the real
+    search() method's own default applies. A wrapper declared as
+    def _search(base=None, scope=None, ...) turns that omission into
+    an explicit scope=None on the forwarded call, and the underlying
+    C extension search() cannot accept None there, only a truly
+    absent argument. That crashed a request the recorder was only
+    supposed to be observing. Passing through the caller's exact
+    args and kwargs, whatever they are, is the only way to guarantee
+    the wrapped call behaves identically to the unwrapped one.
     """
-    def _search(base=None, scope=None, expression=None,
-                attrs=None, controls=None):
-        args = {
+    def _search(*args, **kwargs):
+        base = kwargs.get('base')
+        attrs = kwargs.get('attrs')
+        controls = kwargs.get('controls')
+        logged = {
             'base': str(base) if base is not None else None,
-            'scope': scope,
-            'expression': expression,
+            'scope': kwargs.get('scope'),
+            'expression': kwargs.get('expression'),
             'attrs': list(attrs) if attrs is not None else None,
             'controls': list(controls) if controls is not None else None,
         }
         return session.record(
-            'search', args,
-            lambda: original(
-                base=base, scope=scope, expression=expression,
-                attrs=attrs, controls=controls),
-        )
+            'search', logged, lambda: original(*args, **kwargs))
     return _search
 
 
@@ -289,15 +307,23 @@ def _make_simple_wrapper(session, method_name, original):
     Build a replacement for a zero or one argument helper method
     (domain_dn, get_schema_basedn, get_syntax_oid_from_lDAPDisplayName)
     that logs its call through session before delegating to original.
+
+    Forwards *args and **kwargs exactly as received rather than
+    re-declaring named parameters. See _make_search_wrapper for why
+    that matters: a wrapper signature that does not exactly match the
+    real method's own defaults can change a call's behaviour.
     """
     if method_name == 'get_syntax_oid_from_lDAPDisplayName':
-        def _wrapped(attr):
+        def _wrapped(*args, **kwargs):
+            attr = args[0] if args else kwargs.get('attr')
             return session.record(
-                method_name, {'attr': attr}, lambda: original(attr))
+                method_name, {'attr': attr},
+                lambda: original(*args, **kwargs))
         return _wrapped
 
-    def _wrapped():
-        return session.record(method_name, {}, lambda: original())
+    def _wrapped(*args, **kwargs):
+        return session.record(
+            method_name, {}, lambda: original(*args, **kwargs))
     return _wrapped
 
 

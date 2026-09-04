@@ -157,6 +157,60 @@ def test_session_file_truncates_once_not_per_wrap(record_dir):
     assert calls[1]['args']['base'] == 'CN=bob,DC=vlab,DC=test'
 
 
+def test_omitted_optional_argument_is_not_forced_to_none(record_dir):
+    """
+    Regression test for a bug the recorder itself introduced, found
+    live on 2026-09-04: render_transfer_get() calls
+    self.search(base=..., attrs=..., controls=[]), deliberately
+    omitting scope so the real search() method's own default applies.
+    A wrapper declared as def _search(base=None, scope=None, ...)
+    turns that omission into an explicit scope=None on the forwarded
+    call. The real python-ldb search() cannot accept None for scope,
+    only a truly absent argument, so the wrapped call raised
+    TypeError: 'NoneType' object cannot be interpreted as an integer
+    on a request that would have worked fine unwrapped.
+    """
+    seen = {}
+
+    class HelperWithRequiredScopeDefault(object):
+        SENTINEL_DEFAULT_SCOPE = 2
+
+        def search(self, base=None, scope=SENTINEL_DEFAULT_SCOPE,
+                   expression=None, attrs=None, controls=None):
+            # A real ldb-backed search() would raise here if scope
+            # were explicitly None instead of truly omitted. This
+            # fake instead records what it actually received, since
+            # that is easier to assert on than reproducing the C
+            # extension's exact failure mode.
+            seen['scope'] = scope
+            return FakeResult()
+
+        def domain_dn(self):
+            return 'DC=vlab,DC=test'
+
+        def get_schema_basedn(self):
+            return 'CN=Schema,CN=Configuration,DC=vlab,DC=test'
+
+        def get_syntax_oid_from_lDAPDisplayName(self, attr):
+            return None
+
+        def search_without_scope(self, base):
+            # Mirrors render_transfer_get(): scope is omitted, not
+            # passed as None.
+            return self.search(base=base, attrs=None, controls=[])
+
+    helper = HelperWithRequiredScopeDefault()
+    record.maybe_wrap(helper)
+
+    helper.search_without_scope('CN=Aggregate,CN=Schema,DC=vlab,DC=test')
+
+    assert seen['scope'] == HelperWithRequiredScopeDefault.SENTINEL_DEFAULT_SCOPE, (
+        'the wrapper forwarded an explicit scope, overriding the '
+        'real method\'s own default for an argument the caller '
+        'never passed'
+    )
+
+
 def test_domain_dn_is_captured(record_dir):
     helper = FakeHelper()
     record.maybe_wrap(helper)
