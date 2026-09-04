@@ -4,16 +4,32 @@ Script Name:      record.py
 Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2026-09-03
-Script Version:   1.1.0
+Script Modified:  2026-09-04
+Script Version:   1.2.0
 Script Purpose:   Optional recording layer for the ADWS proxy. When
-                  enabled, captures every LDB call the proxy makes --
-                  arguments and results -- so those exchanges can be
+                  enabled, captures every LDB call the proxy makes,
+                  arguments and results, so those exchanges can be
                   replayed offline by the test suite without a live
                   Samba AD DC.
 
-Script Desc:      Recording is OFF unless the ADWS_RECORD_DIR environment
-                  variable is set, and the wrapper is a transparent
-                  proxy, so this module is inert in normal operation.
+Script Desc:      Recording is OFF unless the ADWS_RECORD_DIR
+                  environment variable is set. When it is set,
+                  maybe_wrap() patches four methods directly onto the
+                  SamDBHelper instance: search, domain_dn,
+                  get_schema_basedn, and get_syntax_oid_from_lDAPDisplayName.
+                  Patching the instance, not wrapping it in a separate
+                  object, is required here. Every LDB call in
+                  sambautils.py happens as self.search(...) from
+                  inside a render_* method, so self is always the
+                  original helper. A composition wrapper with
+                  __getattr__ delegation only intercepts calls made
+                  from outside the object. It cannot see a call made
+                  by one of the helper's own methods against its own
+                  self, so nothing is ever captured. Patching the
+                  instance's own attributes means self.search resolves
+                  to the patched version everywhere, including from
+                  inside render_pull, render_transfer_get, and every
+                  other method that calls self.search(...) directly.
 
                   Typical capture session, inside the container:
 
@@ -31,41 +47,42 @@ Script Desc:      Recording is OFF unless the ADWS_RECORD_DIR environment
 
                   Output layout under ADWS_RECORD_DIR:
 
-                    .session      sentinel; presence means this
+                    .session      sentinel, presence means this
                                   directory already holds a capture
                     calls.jsonl   one JSON object per LDB call
-                    <n>.xml       SOAP exchange n -- the decoded request
+                    <n>.xml       SOAP exchange n, the decoded request
                                   followed by the rendered response
                                   (written by xmlutils.print_xml)
 
-                  calls.jsonl is append-only within one capture session
-                  and each record carries the exchange index it belongs
-                  to, so LDB traffic can be correlated with the SOAP
-                  request that provoked it. main.py is a
+                  calls.jsonl is append only within one capture
+                  session and each record carries the exchange index
+                  it belongs to, so LDB traffic can be correlated with
+                  the SOAP request that provoked it. main.py is a
                   ForkingTCPServer, so a single cmdlet routinely opens
-                  several overlapping connections (one per ADWS
-                  endpoint it touches) and this module runs once per
+                  several overlapping connections, one per ADWS
+                  endpoint it touches, and this module runs once per
                   connection, in a separate forked process each time.
-                  The .session sentinel is what keeps that from
-                  truncating calls.jsonl on every connection instead of
-                  once per session -- see SamDBRecorder.__init__.
+                  The .session sentinel keeps that from truncating
+                  calls.jsonl on every connection instead of once per
+                  session. See _start_session().
 
-                  To start a NEW capture (discarding the old one),
+                  To start a new capture and discard the old one,
                   remove the whole directory first:
 
                     rm -rf /tmp/rec
 
-Script Desc:      Values returned by LDB are arbitrary bytes (SIDs, GUIDs,
-                  security descriptors). The base64 encoding used in the
-                  fixture format is defined once, in tests/stubs/ldb.py
-                  (message_to_dict / message_from_dict). This module
-                  reimplements the encode half rather than importing it,
-                  because the tests/ package is not shipped into the
-                  container image -- see FIXTURE FORMAT below. Keep the
-                  two in step.
+Script Desc:      Values returned by LDB are arbitrary bytes (SIDs,
+                  GUIDs, security descriptors). The base64 encoding
+                  used in the fixture format is defined once, in
+                  tests/stubs/ldb.py (message_to_dict and
+                  message_from_dict). This module reimplements the
+                  encode half rather than importing it, because the
+                  tests package is not shipped into the container
+                  image. See FIXTURE FORMAT below. Keep the two in
+                  step.
 ------------------------------------------------------------------------------
-Execution Context: Imported by main.py. A no-op unless ADWS_RECORD_DIR is
-                   set in the environment.
+Execution Context: Imported by main.py. A no-op unless ADWS_RECORD_DIR
+                   is set in the environment.
 ------------------------------------------------------------------------------
 FIXTURE FORMAT (must match tests/stubs/ldb.py message_from_dict):
   message := {"dn": "<string>", "attrs": {"<name>": ["<base64>", ...]}}
@@ -73,8 +90,15 @@ FIXTURE FORMAT (must match tests/stubs/ldb.py message_from_dict):
               "result": <method-specific>, "error": "<repr>"|null}
 ------------------------------------------------------------------------------
 Change Log:
-  1.0.0  - Initial recording layer supporting search(), domain_dn(),
-           get_schema_basedn() and get_syntax_oid_from_lDAPDisplayName().
+  1.0.0 - Initial recording layer as a composition wrapper around
+            SamDBHelper.
+  1.1.0 - Added a session sentinel so calls.jsonl is truncated once
+            per capture session instead of once per connection.
+  1.2.0 - Replaced the composition wrapper with instance method
+            patching. The wrapper never actually captured anything,
+            since every LDB call in sambautils.py is made as
+            self.search(...) from inside a render_* method, where
+            self is the original unwrapped helper.
 ------------------------------------------------------------------------------
 """
 import json
@@ -86,8 +110,7 @@ log = logging.getLogger(__name__)
 
 ENV_VAR = 'ADWS_RECORD_DIR'
 
-# Methods intercepted on the SamDBHelper. Anything not listed here is
-# passed straight through to the wrapped object untouched.
+# Methods patched onto the SamDBHelper instance when recording is on.
 RECORDED_METHODS = (
     'search',
     'domain_dn',
@@ -96,12 +119,14 @@ RECORDED_METHODS = (
 )
 
 
+# ---- _encode_message ----
 def _encode_message(msg):
     """
-    Serialise one ldb.Message to the JSON-safe fixture form.
+    Serialise one ldb.Message to the JSON safe fixture form.
 
-    Mirrors tests/stubs/ldb.py message_to_dict(). Every attribute value
-    is base64-encoded because LDB values are bytes and may be binary.
+    Mirrors tests/stubs/ldb.py message_to_dict(). Every attribute
+    value is base64 encoded because LDB values are bytes and may be
+    binary.
     """
     attrs = {}
     for key in msg.keys():
@@ -119,13 +144,15 @@ def _encode_message(msg):
     return {'dn': str(msg.get('dn')), 'attrs': attrs}
 
 
+# ---- _encode_result ----
 def _encode_result(result):
     """
-    Serialise an ldb.Result -- its messages and its controls.
+    Serialise an ldb.Result: its messages and its controls.
 
-    result.controls carries the paged_results cookie that render_pull()
-    depends on for paging, so it must be captured alongside the messages
-    or replayed paging tests would be meaningless.
+    result.controls carries the paged_results cookie that
+    render_pull() depends on for paging, so it must be captured
+    alongside the messages or replayed paging tests would be
+    meaningless.
     """
     return {
         'msgs': [_encode_message(m) for m in result],
@@ -134,83 +161,86 @@ def _encode_result(result):
     }
 
 
-class SamDBRecorder(object):
+class _Session(object):
     """
-    Transparent wrapper around SamDBHelper that logs directory calls.
+    Per capture session state: where to write, and which exchange
+    the next write belongs to.
 
-    Attribute access falls through to the wrapped helper for everything
-    except the methods in RECORDED_METHODS, so the proxy behaves
-    identically whether or not recording is active.
+    One instance is created per connection (main.py forks a fresh
+    process per connection), but _start_session() ensures only the
+    first one to reach the record directory truncates calls.jsonl.
     """
 
-    def __init__(self, helper, record_dir):
-        # Bypass our own __getattr__/__setattr__ for these two.
-        object.__setattr__(self, '_helper', helper)
-        object.__setattr__(self, '_dir', record_dir)
-        object.__setattr__(self, '_exchange', 0)
-
+    # ---- __init__ ----
+    def __init__(self, record_dir):
+        """
+        Resolve the output path and truncate calls.jsonl once per
+        capture session, using an atomic sentinel so overlapping
+        connections in separate forked processes do not race.
+        """
+        self.exchange = 0
         os.makedirs(record_dir, exist_ok=True)
-        object.__setattr__(
-            self, '_path', os.path.join(record_dir, 'calls.jsonl'))
+        self.path = os.path.join(record_dir, 'calls.jsonl')
+        self._start_session(record_dir)
+        log.info('ADWS recording enabled -> %s', record_dir)
 
-        # Truncate calls.jsonl exactly once per capture session, not
-        # once per connection.
-        #
-        # main.py is a ForkingTCPServer: every connection runs handle()
-        # in a freshly forked child process, and each child constructs
-        # its own SamDBHelper and wraps it here -- so __init__ runs once
-        # PER CONNECTION, in a separate process each time, with no
-        # shared in-memory state to say "this is not the first one."
-        # A plain `open(path, 'w')` here truncates on every connection,
-        # so with several overlapping connections (normal for an
-        # AD PowerShell cmdlet, which opens parallel connections to
-        # /Windows/Resource and /Windows/Enumeration) each new one wipes
-        # out whatever the previous one had written -- confirmed live,
-        # 2026-09-04: a four-connection capture came back with a 0-byte
-        # calls.jsonl because the last connection to construct a
-        # recorder truncated the file and then never got far enough to
-        # write anything before being reset.
-        #
-        # A sentinel file created with O_CREAT | O_EXCL is atomic across
-        # processes at the OS level: exactly one connection's open()
-        # call can win the race and see the file not yet exist, so
-        # exactly one connection truncates calls.jsonl. Every other
-        # connection -- concurrent or later -- gets FileExistsError and
-        # appends instead.
+    # ---- _start_session ----
+    def _start_session(self, record_dir):
+        """
+        Truncate calls.jsonl exactly once per capture session.
+
+        main.py is a ForkingTCPServer. Every connection runs handle()
+        in a freshly forked child process, and each child builds its
+        own SamDBHelper and calls maybe_wrap() on it, so this runs
+        once per connection, in a separate process each time, with no
+        shared in memory state to say this is not the first one.
+        Confirmed live, 2026-09-04: a four connection capture came
+        back with a 0 byte calls.jsonl because the last connection to
+        reach this code truncated the file and then never got far
+        enough to write anything before being reset.
+
+        A sentinel file created with O_CREAT | O_EXCL is atomic
+        across processes at the OS level. Exactly one connection's
+        open() call can win the race and see the file not yet exist,
+        so exactly one connection truncates calls.jsonl. Every other
+        connection, concurrent or later, gets FileExistsError and
+        appends instead.
+        """
         sentinel = os.path.join(record_dir, '.session')
         try:
             fd = os.open(sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.close(fd)
-            with open(self._path, 'w'):
+            with open(self.path, 'w'):
                 pass
         except FileExistsError:
             pass
-        log.info('ADWS recording enabled -> %s', record_dir)
 
-    # -- exchange correlation --------------------------------------------
-
-    def set_exchange(self, index):
-        """Tag subsequent calls with the SOAP exchange index they serve."""
-        object.__setattr__(self, '_exchange', index)
-
-    # -- capture ----------------------------------------------------------
-
-    def _write(self, entry):
-        entry['exchange'] = self._exchange
+    # ---- write ----
+    def write(self, entry):
+        """
+        Append one JSON record to calls.jsonl, tagged with the
+        current exchange index.
+        """
+        entry['exchange'] = self.exchange
         try:
-            with open(self._path, 'a') as f:
+            with open(self.path, 'a') as f:
                 f.write(json.dumps(entry) + '\n')
         except Exception:
             # Recording must never take down the proxy. A capture
-            # session that loses a line is recoverable; a crashed DC
+            # session that loses a line is recoverable. A crashed DC
             # during capture is not.
             log.exception('failed to write recording entry')
 
-    def _record(self, method, args, call):
+    # ---- record ----
+    def record(self, method, args, call):
+        """
+        Run call(), log its arguments and result (or its exception)
+        to calls.jsonl, then return the result or re-raise.
+        """
         try:
             value = call()
         except Exception as exc:
-            self._write({
+            self.write({
                 'method': method, 'args': args,
                 'result': None, 'error': repr(exc),
             })
@@ -221,16 +251,22 @@ class SamDBRecorder(object):
         else:
             encoded = str(value) if value is not None else None
 
-        self._write({
+        self.write({
             'method': method, 'args': args,
             'result': encoded, 'error': None,
         })
         return value
 
-    # -- intercepted methods ---------------------------------------------
 
-    def search(self, base=None, scope=None, expression=None,
-               attrs=None, controls=None):
+# ---- _make_search_wrapper ----
+def _make_search_wrapper(session, original):
+    """
+    Build a replacement for helper.search that logs its call through
+    session before delegating to the real, unpatched search() bound
+    method captured in original.
+    """
+    def _search(base=None, scope=None, expression=None,
+                attrs=None, controls=None):
         args = {
             'base': str(base) if base is not None else None,
             'scope': scope,
@@ -238,46 +274,52 @@ class SamDBRecorder(object):
             'attrs': list(attrs) if attrs is not None else None,
             'controls': list(controls) if controls is not None else None,
         }
-        return self._record(
+        return session.record(
             'search', args,
-            lambda: self._helper.search(
+            lambda: original(
                 base=base, scope=scope, expression=expression,
                 attrs=attrs, controls=controls),
         )
-
-    def domain_dn(self):
-        return self._record(
-            'domain_dn', {}, lambda: self._helper.domain_dn())
-
-    def get_schema_basedn(self):
-        return self._record(
-            'get_schema_basedn', {},
-            lambda: self._helper.get_schema_basedn())
-
-    def get_syntax_oid_from_lDAPDisplayName(self, attr):
-        return self._record(
-            'get_syntax_oid_from_lDAPDisplayName', {'attr': attr},
-            lambda: self._helper.get_syntax_oid_from_lDAPDisplayName(attr),
-        )
-
-    # -- transparent passthrough -----------------------------------------
-
-    def __getattr__(self, name):
-        # Only reached for attributes not found on the wrapper itself.
-        return getattr(object.__getattribute__(self, '_helper'), name)
-
-    def __setattr__(self, name, value):
-        setattr(self._helper, name, value)
+    return _search
 
 
+# ---- _make_simple_wrapper ----
+def _make_simple_wrapper(session, method_name, original):
+    """
+    Build a replacement for a zero or one argument helper method
+    (domain_dn, get_schema_basedn, get_syntax_oid_from_lDAPDisplayName)
+    that logs its call through session before delegating to original.
+    """
+    if method_name == 'get_syntax_oid_from_lDAPDisplayName':
+        def _wrapped(attr):
+            return session.record(
+                method_name, {'attr': attr}, lambda: original(attr))
+        return _wrapped
+
+    def _wrapped():
+        return session.record(method_name, {}, lambda: original())
+    return _wrapped
+
+
+# ---- record_dir ----
 def record_dir():
-    """Return the configured recording directory, or None if disabled."""
+    """Return the configured recording directory, or None if off."""
     return os.environ.get(ENV_VAR) or None
 
 
+# ---- maybe_wrap ----
 def maybe_wrap(helper):
     """
-    Wrap a SamDBHelper in a recorder if ADWS_RECORD_DIR is set.
+    Patch recording onto a SamDBHelper instance if ADWS_RECORD_DIR is
+    set, then return the same instance.
+
+    Patches search, domain_dn, get_schema_basedn, and
+    get_syntax_oid_from_lDAPDisplayName directly onto helper's own
+    __dict__. Python attribute lookup checks the instance dict before
+    the class, so self.search resolves to the patched version from
+    everywhere, including from inside the helper's own render_*
+    methods, which is the whole point. A composition wrapper cannot
+    do this. See the module docstring.
 
     Returns the helper unchanged when recording is disabled, so the
     call site in main.py is a single unconditional line.
@@ -286,19 +328,29 @@ def maybe_wrap(helper):
     if not target:
         return helper
     try:
-        return SamDBRecorder(helper, target)
+        session = _Session(target)
+        for name in RECORDED_METHODS:
+            original = getattr(helper, name)
+            if name == 'search':
+                wrapped = _make_search_wrapper(session, original)
+            else:
+                wrapped = _make_simple_wrapper(session, name, original)
+            setattr(helper, name, wrapped)
+        setattr(helper, '_adws_record_session', session)
     except Exception:
-        log.exception('could not enable recording; continuing without it')
-        return helper
+        log.exception('could not enable recording, continuing without it')
+    return helper
 
 
+# ---- set_exchange ----
 def set_exchange(helper, index):
     """
-    Tag the recorder with the current SOAP exchange index, if recording.
+    Tag subsequent recorded calls with the SOAP exchange index they
+    serve, if recording is active on this helper.
 
-    Safe to call with an unwrapped helper -- it is a no-op then, which
-    keeps main.py free of recording-related conditionals.
+    Safe to call on a helper that was never wrapped. It is a no-op
+    then, which keeps main.py free of recording related conditionals.
     """
-    setter = getattr(helper, 'set_exchange', None)
-    if setter is not None and isinstance(helper, SamDBRecorder):
-        setter(index)
+    session = getattr(helper, '_adws_record_session', None)
+    if session is not None:
+        session.exchange = index
