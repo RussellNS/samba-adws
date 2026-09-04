@@ -1,3 +1,33 @@
+{# ========================================================================== #}
+{# Template : transfer-Get.xml                                                #}
+{# Purpose  : SOAP response for a WS-Transfer Get request, a single object    #}
+{#            lookup by GUID or DN.                                          #}
+{#                                                                          #}
+{# Context variables supplied by render_transfer_get() in sambautils.py:      #}
+{#                                                                          #}
+{#   MessageID                                                              #}
+{#     Echoed back in RelatesTo so the client can correlate this            #}
+{#     response to the Get request that triggered it.                       #}
+{#                                                                          #}
+{#   attrs                                                                  #}
+{#     List of LdapAttr / SyntheticAttr objects built by                    #}
+{#     build_attr_list(). Every entry, including extendedAttributeInfo,     #}
+{#     renders through the same attr.to_xml() call. Samba computes          #}
+{#     constructed and operational attributes such as                       #}
+{#     extendedAttributeInfo live from the real schema, in the same         #}
+{#     textual format as an ordinary multi-valued Unicode string            #}
+{#     attribute, so no special-casing is needed or wanted here. A          #}
+{#     prior version of this template substituted a static, hardcoded      #}
+{#     dump for extendedAttributeInfo specifically, which discarded         #}
+{#     Samba's real, live value and left it inconsistent with               #}
+{#     attributeTypes (also returned in the same response, always live).    #}
+{#     Confirmed via a live capture, 2026-09-04: Samba returned 1499        #}
+{#     real entries for extendedAttributeInfo on the test domain, while     #}
+{#     the static dump it was replaced with carried 1472 entries from an    #}
+{#     unrelated environment. Do not reintroduce per-attribute              #}
+{#     special-casing here without a live capture proving Samba cannot      #}
+{#     compute the attribute in question.                                   #}
+{# ========================================================================== #}
 <s:Envelope xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:s="http://www.w3.org/2003/05/soap-envelope">
     <s:Header>
         <a:Action s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2004/09/transfer/GetResponse</a:Action>
@@ -8,11 +38,7 @@
 
 {% for attr in attrs %}
 <da:PartialAttribute>
-{%- if attr.attr != 'extendedAttributeInfo' %}
 {{attr.to_xml()|safe}}
-{%- else %}
-{% include 'extendedAttr.xml' %}
-{%- endif %}
 </da:PartialAttribute>
 {% endfor %}
 

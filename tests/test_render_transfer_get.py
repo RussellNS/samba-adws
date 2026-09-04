@@ -170,6 +170,64 @@ def test_is_root_dse_matches_sentinel_guid(sambautils):
 
 
 # ========================================================================== #
+# extendedAttributeInfo                                                      #
+# ========================================================================== #
+# Regression coverage for the fix confirmed live, 2026-09-04: Samba's LDB
+# already computes this attribute correctly and live (1499 real entries
+# on the test domain's Aggregate schema object, confirmed via a captured
+# search()). A prior version of transfer-Get.xml discarded that real data
+# and substituted a static 1472-entry dump captured from an unrelated
+# environment in 2018, leaving attributeTypes (live) and
+# extendedAttributeInfo (stale) internally inconsistent in the same
+# response. render_transfer_get() now needs no special case at all:
+# extendedAttributeInfo is an ordinary multi-valued UnicodeString
+# attribute like any other, once nothing intercepts it.
+
+def test_extended_attribute_info_renders_the_real_ldb_value(
+        sambautils, recording):
+    rec = recording().add_syntax({
+        'extendedAttributeInfo': sambautils.SYNTAX_DIRECTORY_STRING,
+        'attributeTypes': sambautils.SYNTAX_DIRECTORY_STRING,
+    })
+    live_value = (
+        "( 1.2.840.113556.1.4.1693 NAME 'msFRS-Hub-Member' "
+        "PROPERTY-GUID '81FF4356B635A94C9512BAF0BD0A2772' "
+        "PROPERTY-SET-GUID '00000000000000000000000000000000' )"
+    )
+    rec.add_search(
+        [('CN=Aggregate,CN=Schema,CN=Configuration,' + DOMAIN_DN, {
+            'extendedAttributeInfo': [live_value.encode('utf-8')],
+        })],
+        base='CN=Aggregate,CN=Schema,CN=Configuration,' + DOMAIN_DN,
+        attrs=['extendedAttributeInfo'],
+    )
+
+    context = base_context(
+        objectReferenceProperty=(
+            'CN=Aggregate,CN=Schema,CN=Configuration,' + DOMAIN_DN),
+        AttributeType_List=['addata:extendedAttributeInfo'])
+    root = parse(render(sambautils, rec, context))
+
+    value_elem = root.find(
+        './/addata:extendedAttributeInfo/ad:value', NSMAP)
+    assert value_elem is not None, (
+        'extendedAttributeInfo did not render at all')
+    assert value_elem.text == live_value
+
+
+def test_extended_attribute_info_template_file_is_gone():
+    """
+    The static 2018 dump must not come back. If this ever needs to
+    change, it should be a deliberate, reviewed decision, not a merge
+    that silently resurrects the file.
+    """
+    from os.path import dirname, join, exists
+
+    templates_dir = join(dirname(dirname(__file__)), 'adws', 'templates')
+    assert not exists(join(templates_dir, 'extendedAttr.xml'))
+
+
+# ========================================================================== #
 # Known defect                                                               #
 # ========================================================================== #
 
