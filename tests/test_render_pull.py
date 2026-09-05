@@ -496,3 +496,171 @@ def test_relates_to_echoes_request_message_id(sambautils, recording):
     root = parse(render(sambautils, rec, context))
 
     assert root.find('.//a:RelatesTo', NSMAP).text == context['MessageID']
+
+
+# ========================================================================== #
+# Response size budget                                                       #
+# ========================================================================== #
+# Confirmed live, 2026-09-05: the AD PowerShell client enforces a WCF
+# transport quota of roughly 64KB on a single received message. A Pull
+# response above that size is accepted on the wire and then silently
+# discarded, with the connection reset right after -- 194 small,
+# ordinary objects (about 121KB rendered) were rejected this way even
+# though nothing about their content was malformed.
+#
+# These tests stand in a synthetic 'measure_wcf_size' that counts
+# rendered <addata:user> tags rather than encoding real WCF bytes, and
+# monkeypatch PULL_SIZE_BUDGET_BYTES/PULL_SIZE_CHECK_EVERY down to
+# small integers, so the split logic can be exercised precisely without
+# constructing tens of thousands of bytes of fixture data per test.
+
+def _five_user_objects():
+    return [
+        ('CN=user%d,%s' % (i, DOMAIN_DN), {
+            'sAMAccountName': [('user%d' % i).encode()],
+            'cn': [('user%d' % i).encode()],
+            'objectClass': [b'top', b'user'],
+            'userAccountControl': [b'512'],
+            'primaryGroupID': [b'513'],
+        })
+        for i in range(5)
+    ]
+
+
+def _count_objects_measurer(xml):
+    return xml.count('<addata:user>')
+
+
+def test_response_over_budget_is_split_and_deferred(
+        sambautils, recording, monkeypatch):
+    monkeypatch.setattr(sambautils, 'PULL_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'PULL_SIZE_CHECK_EVERY', 1)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        _five_user_objects(),
+        base=DOMAIN_DN, scope=ldb.SCOPE_SUBTREE,
+        expression='(objectClass=user)',
+        attrs=['sAMAccountName', 'cn', 'objectClass',
+               'userAccountControl', 'primaryGroupID'],
+    )
+
+    context = base_context(measure_wcf_size=_count_objects_measurer)
+    root = parse(render(sambautils, rec, context))
+
+    assert len(list(items(root))) == 2, \
+        'budget of 2 objects should keep exactly 2, not all 5'
+    assert root.find('.//wsen:EndOfSequence', NSMAP) is None, \
+        'objects remain deferred, so the sequence must not end here'
+
+    enumeration_context = context['EnumerationContext']
+    assert len(enumeration_context['pending_objects']) == 3
+    assert enumeration_context['ldb_exhausted'] is True, (
+        'LDB itself had no more to give; only the local response size '
+        'is why more objects remain'
+    )
+
+
+def test_second_pull_drains_pending_objects_without_querying_ldb_again(
+        sambautils, recording, monkeypatch):
+    """
+    The follow-up Pull for the deferred objects must not re-search LDB.
+    Only one add_search() is registered; a second, unexpected search()
+    call would raise via Recording's own assertion.
+    """
+    monkeypatch.setattr(sambautils, 'PULL_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'PULL_SIZE_CHECK_EVERY', 1)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        _five_user_objects(),
+        base=DOMAIN_DN, scope=ldb.SCOPE_SUBTREE,
+        expression='(objectClass=user)',
+        attrs=['sAMAccountName', 'cn', 'objectClass',
+               'userAccountControl', 'primaryGroupID'],
+    )
+
+    # Reused across both calls, exactly as EnumerationContext_Dict in
+    # main.py holds one dict per EnumerationContext across connections.
+    shared_enumeration_context = {}
+
+    first_context = base_context(
+        measure_wcf_size=_count_objects_measurer,
+        EnumerationContext=shared_enumeration_context)
+    first_root = parse(render(sambautils, rec, first_context))
+    assert len(list(items(first_root))) == 2
+
+    second_context = base_context(
+        measure_wcf_size=_count_objects_measurer,
+        EnumerationContext=shared_enumeration_context)
+    second_root = parse(render(sambautils, rec, second_context))
+
+    assert len(list(items(second_root))) == 2
+    assert second_root.find('.//wsen:EndOfSequence', NSMAP) is None
+    assert len(shared_enumeration_context['pending_objects']) == 1
+
+    third_context = base_context(
+        measure_wcf_size=_count_objects_measurer,
+        EnumerationContext=shared_enumeration_context)
+    third_root = parse(render(sambautils, rec, third_context))
+
+    assert len(list(items(third_root))) == 1
+    assert third_root.find('.//wsen:EndOfSequence', NSMAP) is not None, \
+        'all 5 objects delivered and LDB exhausted -- sequence must end'
+
+
+def test_oversized_first_chunk_is_kept_rather_than_sent_empty(
+        sambautils, recording, monkeypatch):
+    """
+    A budget that cannot fit even a single checked chunk must not
+    produce an empty page. An empty page could never signal progress
+    or completion, stalling the sequence forever, which is worse than
+    one oversized page. This is the known limit of object-count
+    batching alone -- splitting within a single oversized object is
+    what attribute range retrieval is for, tracked separately.
+    """
+    monkeypatch.setattr(sambautils, 'PULL_SIZE_BUDGET_BYTES', 0)
+    monkeypatch.setattr(sambautils, 'PULL_SIZE_CHECK_EVERY', 1)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        _five_user_objects(),
+        base=DOMAIN_DN, scope=ldb.SCOPE_SUBTREE,
+        expression='(objectClass=user)',
+        attrs=['sAMAccountName', 'cn', 'objectClass',
+               'userAccountControl', 'primaryGroupID'],
+    )
+
+    context = base_context(measure_wcf_size=_count_objects_measurer)
+    root = parse(render(sambautils, rec, context))
+
+    assert len(list(items(root))) == 1, (
+        'a budget of 0 cannot be satisfied by any non-empty chunk; the '
+        'first single object is kept anyway rather than sending nothing'
+    )
+
+
+def test_no_measurer_means_no_split(sambautils, recording, monkeypatch):
+    """
+    Without a measurer supplied (every test context prior to this
+    section, and any real caller that opts out), behaviour must be
+    identical to before this feature existed: every object in one page,
+    regardless of PULL_SIZE_BUDGET_BYTES.
+    """
+    monkeypatch.setattr(sambautils, 'PULL_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'PULL_SIZE_CHECK_EVERY', 1)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        _five_user_objects(),
+        base=DOMAIN_DN, scope=ldb.SCOPE_SUBTREE,
+        expression='(objectClass=user)',
+        attrs=['sAMAccountName', 'cn', 'objectClass',
+               'userAccountControl', 'primaryGroupID'],
+    )
+
+    context = base_context()  # no measure_wcf_size
+    root = parse(render(sambautils, rec, context))
+
+    assert len(list(items(root))) == 5
+    assert root.find('.//wsen:EndOfSequence', NSMAP) is not None

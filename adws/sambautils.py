@@ -4,8 +4,8 @@ Script Name:      sambautils.py
 Script Author:    Neal Russell
 Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
 Script Created:   2024-Jan-01
-Script Modified:  2026-Sep-04
-Script Version:   1.1.15
+Script Modified:  2026-Sep-05
+Script Version:   1.1.16
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -187,11 +187,23 @@ Change Log:
            from the `ldb` module) and by changing the unknown-attribute
            fallback to emit the name 'UnicodeString' instead of an OID
            string, matching every other registry entry.
+  1.1.16 - render_pull() now keeps a single response under
+           PULL_SIZE_BUDGET_BYTES independent of MaxElements, holding
+           back objects that do not fit for the next Pull on the same
+           EnumerationContext instead of emitting one oversized
+           message. See split_objects_by_budget() and the response
+           size budget note in render_pull()'s docstring for the
+           live-confirmed WCF quota this responds to.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
   *  Implement WS-Transfer Create / Delete (New-AD* / Remove-AD*).
   *  Implement MS-ADCAP custom operations (password change, unlock, etc.).
+  *  Implement attribute value range retrieval (the ;range=X-Y
+       selector) for render_transfer_get(), so a single object with an
+       oversized multivalued attribute (a large group's member list,
+       attributeTypes on a schema object) can be split across multiple
+       exchanges the same way render_pull() now splits by object count.
 ------------------------------------------------------------------------------
 """
 from __future__ import print_function, absolute_import
@@ -324,6 +336,36 @@ SCOPE_ADLQ_TO_LDB = {
 #   primaryGroupID     - must be 516 (Domain Controllers group)
 
 DC_QUAL_ATTRS = ['userAccountControl', 'primaryGroupID']
+
+
+
+# ========================================================================== #
+# Pull Response Size Budget                                                  #
+# ========================================================================== #
+# The AD PowerShell client enforces a WCF transport quota on a single
+# received message, confirmed empirically at roughly 64KB (65536
+# bytes): a response above that size is accepted on the wire and then
+# silently discarded, with the connection reset immediately after. A
+# real Windows DC never emits a single oversized WS-Enumeration Pull
+# response; it caps how many objects go into one page independent of
+# what MaxElements the client requested, and relies on the client
+# sending further Pull requests for the rest. render_pull() does the
+# same via _split_objects_by_budget().
+#
+# PULL_SIZE_BUDGET_BYTES sits below the confirmed-good 62104 bytes and
+# well below the confirmed-bad 92530 bytes from the bisection that
+# established this, leaving margin for envelope overhead not directly
+# measured during that bisection.
+#
+# PULL_SIZE_CHECK_EVERY trades precision for speed: re-encoding the
+# full candidate response after every single object added is O(n^2)
+# work across a page. Checking every N objects instead means a page
+# can overshoot the budget by up to one chunk's worth of bytes before
+# the check catches it, which is why the budget itself carries margin
+# rather than sitting exactly at the confirmed threshold.
+
+PULL_SIZE_BUDGET_BYTES = 60000
+PULL_SIZE_CHECK_EVERY  = 10
 
 
 
@@ -601,6 +643,59 @@ def get_rdn(dn):
     if rdn_name and rdn_value:
         return '%s=%s' % (rdn_name, rdn_value)
     return ''
+
+
+
+def split_objects_by_budget(objects, context):
+    """
+    Split a list of (object_class, attrs) tuples into the prefix that
+    fits under PULL_SIZE_BUDGET_BYTES once rendered, and the remainder.
+
+    context['measure_wcf_size'], when present, is a callable supplied
+    by main.py that encodes a candidate XML string through the same
+    WCF binary encoder real responses go through and returns the byte
+    length. sambautils.py has no dependency on the wcf package itself;
+    render_pull() calls this only through that callable, so the split
+    logic lives here while the actual encoding stays main.py's
+    concern. When the callable is absent (every existing test context
+    that does not exercise this path, and any caller that chooses not
+    to enforce a budget) every object is kept and nothing is deferred,
+    matching the behaviour before this function existed.
+
+    Checks the encoded size every PULL_SIZE_CHECK_EVERY objects rather
+    than after each one, so a full page costs a handful of encodes
+    rather than one per object. When even the first chunk checked
+    already exceeds budget on its own, it is kept anyway rather than
+    returning an empty page: a page with nothing in it would leave the
+    caller unable to make progress or signal completion, which is
+    worse than a single oversized page. Per-object splitting for that
+    case is what attribute range retrieval is for, tracked separately.
+    """
+    measure = context.get('measure_wcf_size')
+    if measure is None or not objects:
+        return objects, []
+
+    total = len(objects)
+    for chunk_end in range(PULL_SIZE_CHECK_EVERY, total + PULL_SIZE_CHECK_EVERY,
+                            PULL_SIZE_CHECK_EVERY):
+        chunk_end = min(chunk_end, total)
+        candidate = objects[:chunk_end]
+
+        trial_context = dict(context)
+        trial_context['objects'] = candidate
+        trial_context['is_end'] = False
+        trial_xml = render_template('Pull.xml', **trial_context)
+
+        if measure(trial_xml) > PULL_SIZE_BUDGET_BYTES:
+            previous_end = chunk_end - PULL_SIZE_CHECK_EVERY
+            if previous_end > 0:
+                return objects[:previous_end], objects[previous_end:]
+            return candidate, objects[chunk_end:]
+
+        if chunk_end == total:
+            return objects, []
+
+    return objects, []
 
 
 
@@ -928,10 +1023,30 @@ class SamDBHelper(SamDB):
         request, we build the attr list using only attr_names so that
         objectClass does not appear as a spurious attribute in the
         response payload.
+
+        Response size budget
+        ---------------------
+        A single Pull response is also kept under
+        PULL_SIZE_BUDGET_BYTES, independent of MaxElements. Objects
+        already fetched from LDB but not rendered because a page
+        filled up are held in enumeration_context['pending_objects']
+        and rendered first on the next Pull for this
+        EnumerationContext, before LDB is queried again. Whether LDB
+        itself has any further results beyond what has already been
+        fetched is tracked separately, in
+        enumeration_context['ldb_exhausted'], since that fact does not
+        change while a page is being drained from pending_objects
+        without touching LDB. See split_objects_by_budget().
         """
         SelectionProperty_List = context['SelectionProperty_List']
         enumeration_context    = context['EnumerationContext']
         cookie                 = enumeration_context.get('cookie', '')
+
+        # Objects already fetched from LDB in a previous Pull on this
+        # EnumerationContext that did not fit in that response. Render
+        # these before considering a fresh LDB fetch, so a backlog is
+        # always drained in the order it was originally retrieved.
+        pending_objects = enumeration_context.pop('pending_objects', [])
 
         # Strip namespace prefix from attribute names the client wants.
         # e.g. 'addata:sAMAccountName' -> 'sAMAccountName'
@@ -980,6 +1095,14 @@ class SamDBHelper(SamDB):
                     base_fetch = base_fetch + [_dc_attr]
             attrs_to_fetch = base_fetch
 
+        # When a backlog from a previous Pull already exists, this call
+        # drains it without touching LDB again. Whether LDB itself is
+        # exhausted was already determined the last time it actually
+        # was queried, and is unaffected by draining a local backlog.
+        if pending_objects:
+            new_objects   = []
+            ldb_exhausted = enumeration_context.get('ldb_exhausted', False)
+
         # An empty BaseObject means 'search the entire directory'.
         # Samba's LDB partition module rejects a literal empty base DN
         # with error 32. A real Windows DC performs a global catalog
@@ -991,7 +1114,7 @@ class SamDBHelper(SamDB):
         # objects in the Configuration NC).
         #
         # When BaseObject is non-empty we use it directly as before.
-        if LdapQuery['BaseObject']:
+        elif LdapQuery['BaseObject']:
             # Standard single-base search with paged results support.
             result = self.search(
                 base=LdapQuery['BaseObject'],
@@ -1014,13 +1137,15 @@ class SamDBHelper(SamDB):
                     # Non-empty cookie -- more results waiting.
                     new_cookie = ':' + spl[-1]
                     enumeration_context['cookie'] = new_cookie
-                    context['is_end'] = False
+                    ldb_exhausted = False
                 else:
-                    context['is_end'] = True
+                    ldb_exhausted = True
             else:
-                context['is_end'] = True
+                ldb_exhausted = True
 
             msgs_to_render = list(result.msgs)
+            new_objects    = self._build_objects(
+                msgs_to_render, attr_names, fetch_all)
 
         else:
             # Empty BaseObject means 'search the entire directory'.
@@ -1047,14 +1172,32 @@ class SamDBHelper(SamDB):
                 except Exception:
                     pass
             # Multi-NC results are returned as a single complete page.
-            context['is_end'] = True
+            ldb_exhausted = True
+            new_objects   = self._build_objects(
+                msgs_to_render, attr_names, fetch_all)
 
-        # Build (object_class, attrs) tuples for every result object.
-        #
-        # objectClass is multi-valued and ordered from least- to
-        # most-derived. The last value is what we want: e.g. for a user
-        # the list is ['top', 'person', 'organizationalPerson', 'user']
-        # and we use 'user' as the XML element name.
+        enumeration_context['ldb_exhausted'] = ldb_exhausted
+
+        objects, leftover = split_objects_by_budget(
+            pending_objects + new_objects, context)
+        enumeration_context['pending_objects'] = leftover
+
+        context['objects'] = objects
+        context['is_end']  = ldb_exhausted and not leftover
+        return render_template('Pull.xml', **context)
+
+
+
+    def _build_objects(self, msgs_to_render, attr_names, fetch_all):
+        """
+        Convert LDB result messages into (object_class, attrs) tuples
+        ready for Pull.xml, exactly as render_pull() always has.
+
+        objectClass is multi-valued and ordered from least- to
+        most-derived. The last value is what we want: e.g. for a user
+        the list is ['top', 'person', 'organizationalPerson', 'user']
+        and we use 'user' as the XML element name.
+        """
         objects = []
         for msg in msgs_to_render:
             object_class = (
@@ -1090,9 +1233,7 @@ class SamDBHelper(SamDB):
             )
 
             objects.append((object_class, attrs))
-
-        context['objects'] = objects
-        return render_template('Pull.xml', **context)
+        return objects
 
 
 

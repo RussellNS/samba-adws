@@ -93,6 +93,21 @@ def print_data(msg, data):
         print_hexdump(data, colored=True, file=sys.stderr)
 
 
+def measure_wcf_size(xml):
+    """
+    Functionality: Encodes a candidate SOAP/XML string through the same
+    WCF binary encoder real responses go through before they reach the
+    wire, and returns the resulting byte length.
+
+    Passed into sambautils.SamDBHelper.render_pull() via the context
+    dict so it can measure a response it is building without needing
+    to import wcf itself. render_pull() uses this to keep a Pull
+    response under the AD PowerShell client's WCF transport quota,
+    confirmed empirically at roughly 64KB (see adws/debug_cap.py).
+    """
+    return len(dump_records(XMLParser.parse(xml.encode('utf-8'))))
+
+
 class NETTCPProxy(SocketServer.BaseRequestHandler):
     """
     Class: NETTCPProxy
@@ -262,6 +277,7 @@ class NETTCPProxy(SocketServer.BaseRequestHandler):
                         enumeration_context = EnumerationContext_Dict[EnumerationContext]
                         context['EnumerationContext'] = enumeration_context
                         context.update(enumeration_context)
+                        context['measure_wcf_size'] = measure_wcf_size
                         ack_xml = samdbhelper.render_pull(**context)
 
                 # Action: Topology (New)
