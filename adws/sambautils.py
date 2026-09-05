@@ -1,11 +1,12 @@
 """
 ------------------------------------------------------------------------------
 Script Name:      sambautils.py
-Script Author:    Neal Russell
-Author's Company: N/A (fork of gitlab.com/catalyst-samba/samba-adws)
+Original Author:  Samba Catalyst Team
+Original Link:    https://gitlab.com/catalyst-samba/samba-adws
+Updated by:       Neal Russell
 Script Created:   2024-Jan-01
 Script Modified:  2026-Sep-05
-Script Version:   1.1.16
+Script Version:   1.2.0
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -188,22 +189,34 @@ Change Log:
            fallback to emit the name 'UnicodeString' instead of an OID
            string, matching every other registry entry.
   1.1.16 - render_pull() now keeps a single response under
-           PULL_SIZE_BUDGET_BYTES independent of MaxElements, holding
-           back objects that do not fit for the next Pull on the same
-           EnumerationContext instead of emitting one oversized
-           message. See split_objects_by_budget() and the response
-           size budget note in render_pull()'s docstring for the
-           live-confirmed WCF quota this responds to.
+           WCF_RESPONSE_SIZE_BUDGET_BYTES independent of MaxElements,
+           holding back objects that do not fit for the next Pull on
+           the same EnumerationContext instead of emitting one
+           oversized message. See split_objects_by_budget() and the
+           response size budget note in render_pull()'s docstring for
+           the live-confirmed WCF quota this responds to.
+  1.2.0  - render_transfer_get() implements [MS-ADDM] 2.7 attribute
+           value range retrieval: LdapAttr.apply_range() slices a
+           multivalued attribute to a RangeLow/RangeHigh window, a
+           client's own explicit range request is honoured, and
+           split_attr_values_by_budget() shrinks an otherwise
+           oversized attribute the client did not bound itself. This
+           is the confirmed fix for the WS-Transfer Get response
+           (attributeTypes / extendedAttributeInfo on a schema object)
+           that the object-count fix in 1.1.16 does not cover, since
+           that response is one object with two oversized attributes,
+           not many objects.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
   *  Implement WS-Transfer Create / Delete (New-AD* / Remove-AD*).
   *  Implement MS-ADCAP custom operations (password change, unlock, etc.).
-  *  Implement attribute value range retrieval (the ;range=X-Y
-       selector) for render_transfer_get(), so a single object with an
-       oversized multivalued attribute (a large group's member list,
-       attributeTypes on a schema object) can be split across multiple
-       exchanges the same way render_pull() now splits by object count.
+  *  Implement [MS-ADDM] 2.7's WS-Enumeration range retrieval
+       extension (as opposed to the WS-Transfer one render_transfer_get()
+       now has) so a large multivalued attribute requested via
+       ad:SelectionProperty in an Enumerate/Pull, such as a large
+       group's member list returned from a directory search rather
+       than a direct Get by GUID, can also be range-limited.
 ------------------------------------------------------------------------------
 """
 from __future__ import print_function, absolute_import
@@ -340,32 +353,46 @@ DC_QUAL_ATTRS = ['userAccountControl', 'primaryGroupID']
 
 
 # ========================================================================== #
-# Pull Response Size Budget                                                  #
+# WCF Response Size Budget                                                   #
 # ========================================================================== #
 # The AD PowerShell client enforces a WCF transport quota on a single
 # received message, confirmed empirically at roughly 64KB (65536
 # bytes): a response above that size is accepted on the wire and then
-# silently discarded, with the connection reset immediately after. A
-# real Windows DC never emits a single oversized WS-Enumeration Pull
-# response; it caps how many objects go into one page independent of
-# what MaxElements the client requested, and relies on the client
-# sending further Pull requests for the rest. render_pull() does the
-# same via _split_objects_by_budget().
+# silently discarded, with the connection reset immediately after.
+# This applies to any single ADWS response, not just one shape of it:
 #
-# PULL_SIZE_BUDGET_BYTES sits below the confirmed-good 62104 bytes and
-# well below the confirmed-bad 92530 bytes from the bisection that
-# established this, leaving margin for envelope overhead not directly
-# measured during that bisection.
+#   render_pull()          caps how many OBJECTS go into one
+#                           WS-Enumeration Pull page, independent of
+#                           what MaxElements the client requested, via
+#                           split_objects_by_budget().
 #
-# PULL_SIZE_CHECK_EVERY trades precision for speed: re-encoding the
-# full candidate response after every single object added is O(n^2)
-# work across a page. Checking every N objects instead means a page
-# can overshoot the budget by up to one chunk's worth of bytes before
-# the check catches it, which is why the budget itself carries margin
-# rather than sitting exactly at the confirmed threshold.
+#   render_transfer_get()  caps how many VALUES of a single oversized
+#                           multivalued attribute (attributeTypes,
+#                           extendedAttributeInfo, a large group's
+#                           member list) go into one WS-Transfer Get
+#                           response, via split_attr_values_by_budget()
+#                           and LdapAttr.apply_range(), using the same
+#                           RangeLow/RangeHigh mechanism ([MS-ADDM]
+#                           2.7) a real DC uses for the same purpose.
+#
+# Both rely on the client sending a further request (another Pull, or
+# a Get re-requesting the next range) for whatever did not fit.
+#
+# WCF_RESPONSE_SIZE_BUDGET_BYTES sits below the confirmed-good 62104
+# bytes and well below the confirmed-bad 92530 bytes from the
+# bisection that established this, leaving margin for envelope
+# overhead not directly measured during that bisection.
+#
+# WCF_RESPONSE_SIZE_CHECK_EVERY trades precision for speed:
+# re-encoding the full candidate response after every single item
+# added is O(n^2) work across a page or a large attribute. Checking
+# every N items instead means a response can overshoot the budget by
+# up to one chunk's worth of bytes before the check catches it, which
+# is why the budget itself carries margin rather than sitting exactly
+# at the confirmed threshold.
 
-PULL_SIZE_BUDGET_BYTES = 60000
-PULL_SIZE_CHECK_EVERY  = 10
+WCF_RESPONSE_SIZE_BUDGET_BYTES = 60000
+WCF_RESPONSE_SIZE_CHECK_EVERY  = 10
 
 
 
@@ -485,7 +512,7 @@ ROOT_DSE_ATTRS = {
 #   Windows knows to decode the value on its end.
 
 LDAP_ATTR_TEMPLATE = jinja2.Template("""
-<addata:{{obj.attr}} LdapSyntax="{{obj.ldap_syntax}}">
+<addata:{{obj.attr}}{% if obj.range_low is not none %} RangeLow="{{obj.range_low}}" RangeHigh="{{obj.range_high}}"{% endif %} LdapSyntax="{{obj.ldap_syntax}}">
    {%- for val in obj.vals %}
    <ad:value xsi:type="{{obj.xsi_type}}">{{val}}</ad:value>
    {%- endfor %}
@@ -499,6 +526,17 @@ class LdapAttr(object):
         # LDAP display name of the attribute, e.g. 'sAMAccountName'
         self.attr        = attr
         self.ldap_syntax = ldap_syntax
+
+        # Set only when this attribute represents a partial slice of a
+        # larger multivalued attribute (see apply_range()). RangeLow
+        # and RangeHigh are rendered as XML attributes on this
+        # element, alongside LdapSyntax, only while both are not None
+        # -- per [MS-ADDM] 2.3.3, they are present only "for each
+        # multivalued LDAP attribute for which the server is including
+        # only a portion of the values."
+        self.range_low     = None
+        self.range_high    = None
+        self.range_bounded = None
 
         # xsi_type must be namespace-qualified (e.g. 'xsd:string')
         assert ':' in xsi_type
@@ -538,9 +576,74 @@ class LdapAttr(object):
                     # causing attribute parsing failures on the client.
                     self.xsi_type = 'xsd:base64Binary'
 
+        # Snapshot of the complete, decoded value set, kept so
+        # apply_range() can always slice from the true original values
+        # using absolute indices, however many times it is called.
+        # Without this, a second call (the client's own range, then
+        # this module shrinking that range further) would slice
+        # relative to whatever the first call already narrowed self.vals
+        # down to, silently reporting the wrong RangeLow/RangeHigh to
+        # the client.
+        self._full_vals = list(self.vals)
+
     def to_xml(self):
         """Render this attribute as an XML fragment string."""
         return LDAP_ATTR_TEMPLATE.render({'obj': self})
+
+    def apply_range(self, range_low, range_high=None):
+        """
+        Restrict this attribute's values to a zero-based inclusive
+        range, per [MS-ADDM] 2.7.1's range specifiers, and record the
+        actual bounds applied so to_xml() renders RangeLow/RangeHigh.
+
+        range_high may be an int, or None meaning "everything from
+        range_low onward" (the request-side wildcard '*', or the
+        attribute absent, already resolved to None by the caller).
+        Both bounds are clamped to the real value count, so a request
+        for more than exists (a client re-requesting past the true
+        end, or a caller shrinking by more than what remains) returns
+        whatever is available rather than raising or padding with
+        nothing meaningful.
+
+        range_bounded records whether range_high was given as an
+        explicit number rather than resolved from None, and is what
+        split_attr_values_by_budget() checks before shrinking an
+        already-ranged attribute further. [MS-ADDM] 2.7.1's own
+        examples mark only the open-ended '*' requests as "subject to
+        the limits imposed by the server", not the explicitly bounded
+        ones: 'RangeLow="501" RangeHigh="*"' carries that footnote,
+        'RangeLow="0" RangeHigh="500"' does not. A client's own bounded
+        request is therefore honoured exactly. Its open-ended
+        continuation request (RangeLow one past what it already has,
+        RangeHigh='*', asking for "whatever is left") is exactly the
+        request that can itself still be too large, and is the case
+        this module's own further shrinking exists to catch.
+
+        Used both for a client's explicit range request and for this
+        module's own decision to shrink an otherwise oversized
+        attribute; either way, the result is a real partial slice with
+        accurate bounds, never a slice claiming to be partial when it
+        happens to contain everything.
+
+        Always slices from the original full value set captured at
+        construction (self._full_vals), with range_low and range_high
+        as absolute indices into it, not relative to whatever self.vals
+        currently holds. This is what makes repeated calls composable:
+        the client's own range, further narrowed by this module's own
+        budget shrinking, still reports the true original position of
+        every value kept, rather than the second call's indices being
+        silently relative to the first call's already-narrowed slice.
+        """
+        total = len(self._full_vals)
+        range_low = max(0, min(range_low, total))
+        self.range_bounded = range_high is not None
+        if range_high is None:
+            range_high = total - 1
+        else:
+            range_high = max(range_low, min(range_high, total - 1))
+        self.vals       = self._full_vals[range_low:range_high + 1]
+        self.range_low  = range_low
+        self.range_high = range_high
 
 
 
@@ -649,7 +752,8 @@ def get_rdn(dn):
 def split_objects_by_budget(objects, context):
     """
     Split a list of (object_class, attrs) tuples into the prefix that
-    fits under PULL_SIZE_BUDGET_BYTES once rendered, and the remainder.
+    fits under WCF_RESPONSE_SIZE_BUDGET_BYTES once rendered, and the
+    remainder.
 
     context['measure_wcf_size'], when present, is a callable supplied
     by main.py that encodes a candidate XML string through the same
@@ -662,22 +766,25 @@ def split_objects_by_budget(objects, context):
     to enforce a budget) every object is kept and nothing is deferred,
     matching the behaviour before this function existed.
 
-    Checks the encoded size every PULL_SIZE_CHECK_EVERY objects rather
-    than after each one, so a full page costs a handful of encodes
-    rather than one per object. When even the first chunk checked
-    already exceeds budget on its own, it is kept anyway rather than
-    returning an empty page: a page with nothing in it would leave the
-    caller unable to make progress or signal completion, which is
-    worse than a single oversized page. Per-object splitting for that
-    case is what attribute range retrieval is for, tracked separately.
+    Checks the encoded size every WCF_RESPONSE_SIZE_CHECK_EVERY
+    objects rather than after each one, so a full page costs a handful
+    of encodes rather than one per object. When even the first chunk
+    checked already exceeds budget on its own, it is kept anyway
+    rather than returning an empty page: a page with nothing in it
+    would leave the caller unable to make progress or signal
+    completion, which is worse than a single oversized page. This is
+    the object-count counterpart to split_attr_values_by_budget()
+    below, which shrinks values within a single oversized attribute
+    rather than the number of objects in a page.
     """
     measure = context.get('measure_wcf_size')
     if measure is None or not objects:
         return objects, []
 
     total = len(objects)
-    for chunk_end in range(PULL_SIZE_CHECK_EVERY, total + PULL_SIZE_CHECK_EVERY,
-                            PULL_SIZE_CHECK_EVERY):
+    for chunk_end in range(WCF_RESPONSE_SIZE_CHECK_EVERY,
+                            total + WCF_RESPONSE_SIZE_CHECK_EVERY,
+                            WCF_RESPONSE_SIZE_CHECK_EVERY):
         chunk_end = min(chunk_end, total)
         candidate = objects[:chunk_end]
 
@@ -686,8 +793,8 @@ def split_objects_by_budget(objects, context):
         trial_context['is_end'] = False
         trial_xml = render_template('Pull.xml', **trial_context)
 
-        if measure(trial_xml) > PULL_SIZE_BUDGET_BYTES:
-            previous_end = chunk_end - PULL_SIZE_CHECK_EVERY
+        if measure(trial_xml) > WCF_RESPONSE_SIZE_BUDGET_BYTES:
+            previous_end = chunk_end - WCF_RESPONSE_SIZE_CHECK_EVERY
             if previous_end > 0:
                 return objects[:previous_end], objects[previous_end:]
             return candidate, objects[chunk_end:]
@@ -696,6 +803,93 @@ def split_objects_by_budget(objects, context):
             return objects, []
 
     return objects, []
+
+
+
+def split_attr_values_by_budget(attrs, context):
+    """
+    Shrink whichever of a WS-Transfer Get response's attrs are not
+    already range-limited by the client's own request, until the
+    candidate transfer-Get.xml response fits under
+    WCF_RESPONSE_SIZE_BUDGET_BYTES, applying LdapAttr.apply_range() to
+    each one shrunk so RangeLow/RangeHigh tell the client how to
+    request the remainder ([MS-ADDM] 2.7).
+
+    context['measure_wcf_size'] behaves exactly as in
+    split_objects_by_budget(); its absence means every value is kept,
+    matching behaviour before this function existed.
+
+    Attributes are shrunk one at a time, in the order build_attr_list()
+    produced them, rather than splitting the overage proportionally
+    across every oversized attribute at once. This is the same
+    simplicity trade-off split_objects_by_budget() makes for object
+    count: the confirmed real case (a schema object's attributeTypes
+    and extendedAttributeInfo) has one attribute at a time actually
+    need shrinking in practice, and a global optimum split across
+    multiple simultaneously-oversized attributes is not needed to
+    solve it.
+
+    An attribute the client explicitly bounded (a numeric RangeHigh,
+    not '*' or absent) is left exactly as asked, even if it is still
+    what makes the response too large. Per [MS-ADDM] 2.7.1, only the
+    open-ended requests are documented as "subject to the limits
+    imposed by the server"; see LdapAttr.apply_range()'s range_bounded
+    for the full reasoning. An attribute the client left open-ended,
+    or never ranged at all, remains eligible for shrinking here.
+
+    An attribute with WCF_RESPONSE_SIZE_CHECK_EVERY values or fewer is
+    never shrunk. Applying a range to it would either accomplish
+    nothing (it already fits within one checked chunk) or, worse,
+    incorrectly mark a complete attribute as partial by giving it a
+    RangeLow/RangeHigh that happens to cover every value it has --
+    per [MS-ADDM] 2.3.3, those XML attributes must appear only when
+    the server is genuinely including "only a portion of the values".
+    """
+    measure = context.get('measure_wcf_size')
+    if measure is None or not attrs:
+        return attrs
+
+    def candidate_size():
+        trial_context = dict(context)
+        trial_context['attrs'] = attrs
+        trial_xml = render_template('transfer-Get.xml', **trial_context)
+        return measure(trial_xml)
+
+    if candidate_size() <= WCF_RESPONSE_SIZE_BUDGET_BYTES:
+        return attrs
+
+    for attr in attrs:
+        if attr.range_bounded:
+            continue  # client gave an explicit numeric bound; honour it
+
+        # start is the absolute index this attribute's currently kept
+        # values begin at: 0 for a never-ranged attribute, or the
+        # client's own RangeLow for an open-ended continuation still
+        # being narrowed further. available is how many values are
+        # kept right now, which for a continuation already reflects
+        # the client's own range, not the attribute's full length.
+        # apply_range() always takes absolute indices into the true
+        # original value set (see its docstring), so every reduction
+        # here must be expressed relative to start, not to 0, or a
+        # continuation's second shrink would silently misreport which
+        # original values it actually kept.
+        start     = attr.range_low if attr.range_low is not None else 0
+        available = len(attr.vals)
+        if available <= WCF_RESPONSE_SIZE_CHECK_EVERY:
+            continue  # too few values to shrink meaningfully or safely
+
+        for keep in range(WCF_RESPONSE_SIZE_CHECK_EVERY, available,
+                           WCF_RESPONSE_SIZE_CHECK_EVERY):
+            attr.apply_range(start, start + keep - 1)
+            if candidate_size() <= WCF_RESPONSE_SIZE_BUDGET_BYTES:
+                return attrs
+        # This attribute alone could not bring the response under
+        # budget even reduced to its smallest checked chunk below its
+        # own total. It is left at that reduced size (a genuine
+        # partial slice, so its RangeLow/RangeHigh are accurate) and
+        # the loop moves on to try shrinking the next attribute too.
+
+    return attrs
 
 
 
@@ -928,8 +1122,26 @@ class SamDBHelper(SamDB):
         GUID of the object to retrieve. Samba accepts GUIDs as LDB
         search base DNs in the format '<GUID=...>', so we pass it
         directly to self.search().
+
+        Attribute value range retrieval
+        --------------------------------
+        context['AttributeRanges'], when present, maps a stripped
+        attribute name to the (RangeLow, RangeHigh) strings the client
+        put on that attribute's da:AttributeType request element
+        ([MS-ADDM] 2.7.2.1). Applied to the matching LdapAttr via
+        apply_range() before the size budget is considered, so a
+        client explicitly continuing a previous partial fetch gets
+        exactly the range it asked for, further shrunk only if that
+        exact range is itself still too large to fit.
+
+        Any attribute the client did NOT explicitly range is still
+        subject to split_attr_values_by_budget() shrinking it on this
+        module's own initiative if the full response would otherwise
+        exceed WCF_RESPONSE_SIZE_BUDGET_BYTES. See that function and
+        the WCF Response Size Budget section above.
         """
         AttributeType_List = context['AttributeType_List']
+        attribute_ranges   = context.get('AttributeRanges', {})
 
         # Strip namespace prefix from each attribute name.
         # e.g. 'addata:sAMAccountName' -> 'sAMAccountName'
@@ -969,6 +1181,21 @@ class SamDBHelper(SamDB):
 
         msg   = result[0]
         attrs = self.build_attr_list(msg, attr_names=build_names)
+
+        # Apply any range the client explicitly requested for this
+        # object's follow-up Get, per attribute. RangeHigh of '*' (or
+        # absent) means "everything from RangeLow onward" -- resolved
+        # to None here so apply_range() treats it as open-ended.
+        for attr in attrs:
+            if attr.attr in attribute_ranges:
+                range_low, range_high = attribute_ranges[attr.attr]
+                attr.apply_range(
+                    int(range_low.strip()),
+                    None if range_high in (None, '*')
+                    else int(range_high.strip()),
+                )
+
+        attrs = split_attr_values_by_budget(attrs, context)
 
         context['attrs'] = attrs
         return render_template('transfer-Get.xml', **context)
@@ -1027,7 +1254,7 @@ class SamDBHelper(SamDB):
         Response size budget
         ---------------------
         A single Pull response is also kept under
-        PULL_SIZE_BUDGET_BYTES, independent of MaxElements. Objects
+        WCF_RESPONSE_SIZE_BUDGET_BYTES, independent of MaxElements. Objects
         already fetched from LDB but not rendered because a page
         filled up are held in enumeration_context['pending_objects']
         and rendered first on the next Pull for this

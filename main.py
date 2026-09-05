@@ -99,9 +99,10 @@ def measure_wcf_size(xml):
     WCF binary encoder real responses go through before they reach the
     wire, and returns the resulting byte length.
 
-    Passed into sambautils.SamDBHelper.render_pull() via the context
-    dict so it can measure a response it is building without needing
-    to import wcf itself. render_pull() uses this to keep a Pull
+    Passed into every sambautils.SamDBHelper render_* call via the
+    context dict so a response can be measured while it is built
+    without sambautils.py needing to import wcf itself.
+    render_pull() and render_transfer_get() both use this to keep a
     response under the AD PowerShell client's WCF transport quota,
     confirmed empirically at roughly 64KB (see adws/debug_cap.py).
     """
@@ -215,9 +216,24 @@ class NETTCPProxy(SocketServer.BaseRequestHandler):
                 # Extract LDAP attributes requested by the client
                 # could be LDAP attrs or
                 # synthetic attrs with namespace prefix
-                AttributeType_List = xmlhelper.get_elem_list(
-                    './/s:Body/da:BaseObjectSearchRequest/da:AttributeType',
-                    as_text=True)
+                #
+                # Fetched as elements, not as_text=True, so a
+                # da:AttributeType carrying RangeLow/RangeHigh XML
+                # attributes (a client continuing a previous partial
+                # WS-Transfer Get, per [MS-ADDM] 2.7.2.1) is not
+                # silently reduced to just its text and stripped of
+                # that range specifier before render_transfer_get()
+                # ever sees it.
+                AttributeType_Elems = xmlhelper.get_elem_list(
+                    './/s:Body/da:BaseObjectSearchRequest/da:AttributeType')
+                AttributeType_List = [
+                    elem.text.strip() for elem in AttributeType_Elems]
+                AttributeRanges = {
+                    elem.text.strip().split(':')[-1]: (
+                        elem.get('RangeLow'), elem.get('RangeHigh'))
+                    for elem in AttributeType_Elems
+                    if elem.get('RangeLow') is not None
+                }
 
                 # Build context mapping for the AD backend
                 context = {
@@ -226,6 +242,8 @@ class NETTCPProxy(SocketServer.BaseRequestHandler):
                     'Action': xmlhelper.get_elem_text('.//a:Action'),
                     'To': xmlhelper.get_elem_text('.//a:To'),
                     'AttributeType_List': AttributeType_List,
+                    'AttributeRanges': AttributeRanges,
+                    'measure_wcf_size': measure_wcf_size,
                     'xmlhelper': xmlhelper,   # pass through for topology data actions
                 }
 
@@ -277,7 +295,6 @@ class NETTCPProxy(SocketServer.BaseRequestHandler):
                         enumeration_context = EnumerationContext_Dict[EnumerationContext]
                         context['EnumerationContext'] = enumeration_context
                         context.update(enumeration_context)
-                        context['measure_wcf_size'] = measure_wcf_size
                         ack_xml = samdbhelper.render_pull(**context)
 
                 # Action: Topology (New)

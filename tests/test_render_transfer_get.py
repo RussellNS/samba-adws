@@ -26,6 +26,7 @@ SYNTAXES = {
     'cn': ldb.SYNTAX_DIRECTORY_STRING,
     'description': ldb.SYNTAX_DIRECTORY_STRING,
     'objectClass': ldb.SYNTAX_DIRECTORY_STRING,
+    'member': ldb.SYNTAX_DN,
 }
 
 
@@ -225,6 +226,223 @@ def test_extended_attribute_info_template_file_is_gone():
 
     templates_dir = join(dirname(dirname(__file__)), 'adws', 'templates')
     assert not exists(join(templates_dir, 'extendedAttr.xml'))
+
+
+# ========================================================================== #
+# Attribute value range retrieval                                            #
+# ========================================================================== #
+# [MS-ADDM] 2.7: a client can ask for only part of a large multivalued
+# attribute via RangeLow/RangeHigh XML attributes on the request's
+# da:AttributeType element, and the server marks a partial response the
+# same way on the response element. This module's own budget logic can
+# also decide unilaterally to return only part of an attribute the
+# client did not range at all, confirmed live 2026-09-05 as the actual
+# blocker behind a 923KB WS-Transfer Get response the AD PowerShell
+# client silently rejected.
+
+def _count_values_measurer(xml):
+    return xml.count('<ad:value')
+
+
+def test_client_requested_bounded_range_is_honoured_exactly(
+        sambautils, recording):
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [(GUID_REF, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(10)],
+        })],
+        base=GUID_REF, attrs=['member'],
+    )
+
+    context = base_context(
+        AttributeType_List=['addata:member'],
+        AttributeRanges={'member': ('2', '3')})
+    root = parse(render(sambautils, rec, context))
+
+    member_elem = root.find('.//addata:member', NSMAP)
+    assert member_elem.get('RangeLow') == '2'
+    assert member_elem.get('RangeHigh') == '3'
+    values = [v.text for v in member_elem.findall('ad:value', NSMAP)]
+    assert values == ['CN=user2,%s' % DOMAIN_DN, 'CN=user3,%s' % DOMAIN_DN]
+
+
+def test_open_ended_range_resolves_to_the_true_last_index(
+        sambautils, recording):
+    """RangeHigh='*' means 'everything from RangeLow onward'."""
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [(GUID_REF, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(5)],
+        })],
+        base=GUID_REF, attrs=['member'],
+    )
+
+    context = base_context(
+        AttributeType_List=['addata:member'],
+        AttributeRanges={'member': ('2', '*')})
+    root = parse(render(sambautils, rec, context))
+
+    member_elem = root.find('.//addata:member', NSMAP)
+    assert member_elem.get('RangeLow') == '2'
+    assert member_elem.get('RangeHigh') == '4'
+    assert len(member_elem.findall('ad:value', NSMAP)) == 3
+
+
+def test_unranged_oversized_attribute_is_shrunk_by_the_server(
+        sambautils, recording, monkeypatch):
+    """
+    The confirmed live scenario: the client's FIRST request for this
+    object carries no range at all, and the full attribute would make
+    the response too large. The server ranges it unilaterally.
+    """
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 1)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [(GUID_REF, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(5)],
+        })],
+        base=GUID_REF, attrs=['member'],
+    )
+
+    context = base_context(
+        AttributeType_List=['addata:member'],
+        measure_wcf_size=_count_values_measurer)
+    root = parse(render(sambautils, rec, context))
+
+    member_elem = root.find('.//addata:member', NSMAP)
+    assert member_elem.get('RangeLow') == '0'
+    assert member_elem.get('RangeHigh') == '0', (
+        'budget of 2 values total, and this object has no other '
+        'attributes, so member alone must be cut to a single value'
+    )
+
+
+def test_client_open_ended_continuation_can_still_be_shrunk(
+        sambautils, recording, monkeypatch):
+    """
+    The client's follow-up request for 'whatever is left' (RangeHigh
+    absent or '*') is documented as still subject to server limits,
+    unlike an explicitly bounded request. If the remainder is itself
+    still too large, the server ranges it again.
+    """
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 1)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [(GUID_REF, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(10)],
+        })],
+        base=GUID_REF, attrs=['member'],
+    )
+
+    # Continuing a previous fetch that already delivered values 0-4.
+    context = base_context(
+        AttributeType_List=['addata:member'],
+        AttributeRanges={'member': ('5', '*')},
+        measure_wcf_size=_count_values_measurer)
+    root = parse(render(sambautils, rec, context))
+
+    member_elem = root.find('.//addata:member', NSMAP)
+    assert member_elem.get('RangeLow') == '5'
+    assert member_elem.get('RangeHigh') == '5', (
+        'the open-ended continuation itself had 5 values left (5-9), '
+        'still over budget, so it must be shrunk again rather than '
+        'sent whole because the client already supplied a range'
+    )
+
+
+def test_client_bounded_range_is_not_shrunk_even_if_still_oversized(
+        sambautils, recording, monkeypatch):
+    """
+    An explicitly bounded request (numeric RangeHigh, not '*') is
+    honoured exactly per [MS-ADDM] 2.7.1, even if that exact range is
+    what makes the response too large -- only open-ended requests and
+    unranged attributes are eligible for further server shrinking.
+    """
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 1)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [(GUID_REF, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(10)],
+        })],
+        base=GUID_REF, attrs=['member'],
+    )
+
+    context = base_context(
+        AttributeType_List=['addata:member'],
+        AttributeRanges={'member': ('0', '4')},  # explicit, bounded
+        measure_wcf_size=_count_values_measurer)
+    root = parse(render(sambautils, rec, context))
+
+    member_elem = root.find('.//addata:member', NSMAP)
+    assert member_elem.get('RangeHigh') == '4', (
+        'the client asked for exactly 0-4; that must be honoured even '
+        'though 5 values still exceeds the tiny test budget'
+    )
+    assert len(member_elem.findall('ad:value', NSMAP)) == 5
+
+
+def test_small_attribute_is_never_given_a_range(sambautils, recording,
+                                                 monkeypatch):
+    """
+    An attribute with too few values to matter for the size budget
+    must never gain RangeLow/RangeHigh -- doing so would mark a
+    complete attribute as partial, which [MS-ADDM] 2.3.3 reserves for
+    a genuinely incomplete one.
+    """
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 10)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [(GUID_REF, {'member': [b'CN=user0,' + DOMAIN_DN.encode()]})],
+        base=GUID_REF, attrs=['member'],
+    )
+
+    context = base_context(
+        AttributeType_List=['addata:member'],
+        measure_wcf_size=_count_values_measurer)
+    root = parse(render(sambautils, rec, context))
+
+    member_elem = root.find('.//addata:member', NSMAP)
+    assert member_elem.get('RangeLow') is None
+    assert member_elem.get('RangeHigh') is None
+
+
+def test_no_measurer_means_attribute_is_never_ranged(
+        sambautils, recording, monkeypatch):
+    """
+    Without a measurer supplied, behaviour is identical to before this
+    feature existed: the full attribute renders, unranged, regardless
+    of WCF_RESPONSE_SIZE_BUDGET_BYTES.
+    """
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 2)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [(GUID_REF, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(5)],
+        })],
+        base=GUID_REF, attrs=['member'],
+    )
+
+    context = base_context(AttributeType_List=['addata:member'])
+    root = parse(render(sambautils, rec, context))
+
+    member_elem = root.find('.//addata:member', NSMAP)
+    assert member_elem.get('RangeLow') is None
+    assert len(member_elem.findall('ad:value', NSMAP)) == 5
 
 
 # ========================================================================== #

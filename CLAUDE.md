@@ -16,9 +16,10 @@ Here is an example of a introductory script docstring.  Match this style:
 """
 ------------------------------------------------------------------------------
 Script Name:      ollama_analyze_discrepancy
-Script Author:    Neal Russell
-Author's Company: N/A
-Script Created:   2026-Aug-09
+Original Author:  Samba Catalyst Team
+Original Link:    https://gitlab.com/catalyst-samba/samba-adws
+Updated by:       Neal Russell
+Script Created:   2018-Nov-13
 Script Modified:  2026-Aug-14
 Script Version:   1.0.3
 Script Purpose:   Given the discrepancies found by 'validate_ollama_data',

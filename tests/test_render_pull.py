@@ -510,7 +510,7 @@ def test_relates_to_echoes_request_message_id(sambautils, recording):
 #
 # These tests stand in a synthetic 'measure_wcf_size' that counts
 # rendered <addata:user> tags rather than encoding real WCF bytes, and
-# monkeypatch PULL_SIZE_BUDGET_BYTES/PULL_SIZE_CHECK_EVERY down to
+# monkeypatch WCF_RESPONSE_SIZE_BUDGET_BYTES/WCF_RESPONSE_SIZE_CHECK_EVERY down to
 # small integers, so the split logic can be exercised precisely without
 # constructing tens of thousands of bytes of fixture data per test.
 
@@ -533,8 +533,8 @@ def _count_objects_measurer(xml):
 
 def test_response_over_budget_is_split_and_deferred(
         sambautils, recording, monkeypatch):
-    monkeypatch.setattr(sambautils, 'PULL_SIZE_BUDGET_BYTES', 2)
-    monkeypatch.setattr(sambautils, 'PULL_SIZE_CHECK_EVERY', 1)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 1)
 
     rec = recording().add_syntax(SYNTAXES)
     rec.add_search(
@@ -568,8 +568,8 @@ def test_second_pull_drains_pending_objects_without_querying_ldb_again(
     Only one add_search() is registered; a second, unexpected search()
     call would raise via Recording's own assertion.
     """
-    monkeypatch.setattr(sambautils, 'PULL_SIZE_BUDGET_BYTES', 2)
-    monkeypatch.setattr(sambautils, 'PULL_SIZE_CHECK_EVERY', 1)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 1)
 
     rec = recording().add_syntax(SYNTAXES)
     rec.add_search(
@@ -619,8 +619,8 @@ def test_oversized_first_chunk_is_kept_rather_than_sent_empty(
     batching alone -- splitting within a single oversized object is
     what attribute range retrieval is for, tracked separately.
     """
-    monkeypatch.setattr(sambautils, 'PULL_SIZE_BUDGET_BYTES', 0)
-    monkeypatch.setattr(sambautils, 'PULL_SIZE_CHECK_EVERY', 1)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 0)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 1)
 
     rec = recording().add_syntax(SYNTAXES)
     rec.add_search(
@@ -645,10 +645,10 @@ def test_no_measurer_means_no_split(sambautils, recording, monkeypatch):
     Without a measurer supplied (every test context prior to this
     section, and any real caller that opts out), behaviour must be
     identical to before this feature existed: every object in one page,
-    regardless of PULL_SIZE_BUDGET_BYTES.
+    regardless of WCF_RESPONSE_SIZE_BUDGET_BYTES.
     """
-    monkeypatch.setattr(sambautils, 'PULL_SIZE_BUDGET_BYTES', 2)
-    monkeypatch.setattr(sambautils, 'PULL_SIZE_CHECK_EVERY', 1)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 1)
 
     rec = recording().add_syntax(SYNTAXES)
     rec.add_search(
