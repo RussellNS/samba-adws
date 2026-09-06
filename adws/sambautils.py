@@ -5,8 +5,8 @@ Original Author:  Samba Catalyst Team
 Original Link:    https://gitlab.com/catalyst-samba/samba-adws
 Updated by:       Neal Russell
 Script Created:   2024-Jan-01
-Script Modified:  2026-Sep-05
-Script Version:   1.2.0
+Script Modified:  2026-Sep-06
+Script Version:   1.2.1
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -206,6 +206,16 @@ Change Log:
            that the object-count fix in 1.1.16 does not cover, since
            that response is one object with two oversized attributes,
            not many objects.
+  1.2.1  - Fixed split_attr_values_by_budget() crashing with
+           AttributeError the moment its loop reached a SyntheticAttr
+           (distinguishedName, requested alongside the oversized
+           attributes on the exact live request 1.2.0 exists to fix).
+           Replaced its linear, smallest-fitting-size chunk scan with
+           a binary search for the largest fitting size, cutting a
+           confirmed 30+ second real request (two ~1500-value
+           attributes) down to about 1.5 seconds and no longer
+           leaving usable budget on the table by stopping at the
+           first size that happened to fit.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
@@ -819,6 +829,14 @@ def split_attr_values_by_budget(attrs, context):
     split_objects_by_budget(); its absence means every value is kept,
     matching behaviour before this function existed.
 
+    Only LdapAttr instances are shrink candidates. attrs also carries
+    SyntheticAttr entries (distinguishedName, relativeDistinguishedName,
+    ...), which have no values to range and no apply_range() at all --
+    confirmed live, 2026-09-05: this loop originally checked
+    attr.range_bounded unconditionally and crashed with AttributeError
+    the moment it reached one, on the very request this feature exists
+    to fix.
+
     Attributes are shrunk one at a time, in the order build_attr_list()
     produced them, rather than splitting the overage proportionally
     across every oversized attribute at once. This is the same
@@ -844,6 +862,22 @@ def split_attr_values_by_budget(attrs, context):
     RangeLow/RangeHigh that happens to cover every value it has --
     per [MS-ADDM] 2.3.3, those XML attributes must appear only when
     the server is genuinely including "only a portion of the values".
+
+    The largest fitting prefix of each shrunk attribute's values is
+    found by binary search, not a linear scan from
+    WCF_RESPONSE_SIZE_CHECK_EVERY upward. Two reasons, confirmed live
+    together, 2026-09-05: encoding a full candidate response is not
+    cheap, and a real 1499-value attribute made a linear scan take
+    over 30 seconds (up to ~150 full re-encodes, since every other
+    still-full oversized attribute is re-encoded on every one of those
+    checks too). A linear scan that returns on the first checked size
+    that fits is also not the largest one that would fit; it stops at
+    whatever the smallest checked increment happens to satisfy,
+    wasting real capacity on every page for no benefit. Binary search
+    finds the true largest fitting size in O(log n) encodes instead of
+    O(n / WCF_RESPONSE_SIZE_CHECK_EVERY), and does so correctly by
+    construction, since candidate size only grows as more values of
+    the same attribute are kept.
     """
     measure = context.get('measure_wcf_size')
     if measure is None or not attrs:
@@ -859,6 +893,8 @@ def split_attr_values_by_budget(attrs, context):
         return attrs
 
     for attr in attrs:
+        if not isinstance(attr, LdapAttr):
+            continue  # SyntheticAttr has no values to range
         if attr.range_bounded:
             continue  # client gave an explicit numeric bound; honour it
 
@@ -878,16 +914,31 @@ def split_attr_values_by_budget(attrs, context):
         if available <= WCF_RESPONSE_SIZE_CHECK_EVERY:
             continue  # too few values to shrink meaningfully or safely
 
-        for keep in range(WCF_RESPONSE_SIZE_CHECK_EVERY, available,
-                           WCF_RESPONSE_SIZE_CHECK_EVERY):
+        low, high, best = 1, available, 0
+        while low <= high:
+            keep = (low + high) // 2
             attr.apply_range(start, start + keep - 1)
             if candidate_size() <= WCF_RESPONSE_SIZE_BUDGET_BYTES:
-                return attrs
-        # This attribute alone could not bring the response under
-        # budget even reduced to its smallest checked chunk below its
-        # own total. It is left at that reduced size (a genuine
-        # partial slice, so its RangeLow/RangeHigh are accurate) and
-        # the loop moves on to try shrinking the next attribute too.
+                best = keep
+                low  = keep + 1
+            else:
+                high = keep - 1
+
+        # Even a single value of this attribute did not fit alongside
+        # everything else currently in the response. Keep exactly one
+        # anyway rather than drop it to zero: an attribute rendered
+        # with no values at all is indistinguishable from the
+        # "Encountered attribute" client error this proxy has hit
+        # before when a requested attribute goes missing entirely.
+        attr.apply_range(start, start + max(best, 1) - 1)
+
+        if candidate_size() <= WCF_RESPONSE_SIZE_BUDGET_BYTES:
+            return attrs
+        # This attribute alone, even at its largest fitting size,
+        # did not bring the whole response under budget. It is left
+        # at that size (a genuine partial slice, so its
+        # RangeLow/RangeHigh are accurate) and the loop moves on to
+        # try shrinking the next attribute too.
 
     return attrs
 

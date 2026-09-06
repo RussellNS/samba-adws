@@ -316,9 +316,10 @@ def test_unranged_oversized_attribute_is_shrunk_by_the_server(
 
     member_elem = root.find('.//addata:member', NSMAP)
     assert member_elem.get('RangeLow') == '0'
-    assert member_elem.get('RangeHigh') == '0', (
+    assert member_elem.get('RangeHigh') == '1', (
         'budget of 2 values total, and this object has no other '
-        'attributes, so member alone must be cut to a single value'
+        'attributes, so member should keep the largest fitting '
+        'prefix -- 2 values, not just the first size tried'
     )
 
 
@@ -351,11 +352,66 @@ def test_client_open_ended_continuation_can_still_be_shrunk(
 
     member_elem = root.find('.//addata:member', NSMAP)
     assert member_elem.get('RangeLow') == '5'
-    assert member_elem.get('RangeHigh') == '5', (
+    assert member_elem.get('RangeHigh') == '6', (
         'the open-ended continuation itself had 5 values left (5-9), '
-        'still over budget, so it must be shrunk again rather than '
-        'sent whole because the client already supplied a range'
+        'still over budget, so it must be shrunk again -- to the '
+        'largest fitting prefix, 2 values -- rather than sent whole '
+        'because the client already supplied a range'
     )
+
+
+def test_synthetic_attr_alongside_an_oversized_attribute_does_not_crash(
+        sambautils, recording, monkeypatch):
+    """
+    Regression test for a crash confirmed live, 2026-09-05:
+    -Properties * on the schema Aggregate object requests
+    distinguishedName alongside attributeTypes and
+    extendedAttributeInfo, two large attributes, not one.
+    build_attr_list() renders distinguishedName as a SyntheticAttr,
+    which has no apply_range() and no range_bounded at all.
+    split_attr_values_by_budget() originally checked
+    attr.range_bounded on every entry unconditionally and raised
+    AttributeError the moment it reached the SyntheticAttr.
+
+    Two oversized attributes, not one, is what actually forced that:
+    with only one large attribute, shrinking it alone can satisfy a
+    small test budget and the loop returns before ever reaching a
+    SyntheticAttr later in the list, which is exactly why an earlier
+    version of this test passed even with the crash's guard removed
+    entirely -- it never exercised the code path it claimed to.
+    """
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 1)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 1)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [(GUID_REF, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(5)],
+            'proxyAddresses': [('SMTP:user%d@vlab.test' % i).encode()
+                               for i in range(5)],
+            'distinguishedName': [
+                ('CN=group1,%s' % DOMAIN_DN).encode()],
+        })],
+        base=GUID_REF, attrs=['member', 'proxyAddresses',
+                              'distinguishedName'],
+    )
+
+    context = base_context(
+        AttributeType_List=[
+            'addata:member', 'addata:proxyAddresses',
+            'ad:distinguishedName'],
+        measure_wcf_size=_count_values_measurer)
+
+    # Must not raise AttributeError. Both member and proxyAddresses
+    # shrink to their minimum (1 value each) and the combined response
+    # still exceeds the budget of 1, so the loop must run all the way
+    # through both before reaching distinguishedName.
+    root = parse(render(sambautils, rec, context))
+
+    assert root.find('.//ad:distinguishedName', NSMAP) is not None
+    member_elem = root.find('.//addata:member', NSMAP)
+    assert member_elem.get('RangeLow') == '0'
 
 
 def test_client_bounded_range_is_not_shrunk_even_if_still_oversized(
