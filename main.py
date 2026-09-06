@@ -275,8 +275,27 @@ class NETTCPProxy(SocketServer.BaseRequestHandler):
                         child.tag[adlq_len:]: (child.text or "").strip()
                         for child in ldapquery_elem
                     }
-                    enumeration_context['SelectionProperty_List'] = xmlhelper.get_elem_list(
-                        './/ad:SelectionProperty', as_text=True)
+                    # Fetched as elements, not as_text=True, for the
+                    # same reason as AttributeType_Elems above: an
+                    # ad:SelectionProperty carrying RangeLow/RangeHigh
+                    # ([MS-ADDM] 2.7.2.2, the WS-Enumeration range
+                    # retrieval extension) must not be silently
+                    # reduced to just its text. Captured once here at
+                    # Enumerate time and persisted in
+                    # enumeration_context, since a client's range
+                    # request for an Enumerate/Pull search applies to
+                    # every subsequent Pull on this EnumerationContext,
+                    # not re-sent per Pull.
+                    SelectionProperty_Elems = xmlhelper.get_elem_list(
+                        './/ad:SelectionProperty')
+                    enumeration_context['SelectionProperty_List'] = [
+                        elem.text.strip() for elem in SelectionProperty_Elems]
+                    enumeration_context['SelectionPropertyRanges'] = {
+                        elem.text.strip().split(':')[-1]: (
+                            elem.get('RangeLow'), elem.get('RangeHigh'))
+                        for elem in SelectionProperty_Elems
+                        if elem.get('RangeLow') is not None
+                    }
 
                     # Generate a unique handle for the client to reference this search
                     EnumerationContext = str(uuid.uuid1())

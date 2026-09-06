@@ -664,3 +664,135 @@ def test_no_measurer_means_no_split(sambautils, recording, monkeypatch):
 
     assert len(list(items(root))) == 5
     assert root.find('.//wsen:EndOfSequence', NSMAP) is not None
+
+
+# ========================================================================== #
+# Per-object attribute value range retrieval                                #
+# ========================================================================== #
+# Confirmed live, 2026-09-06: an Enumerate/Pull search can match a
+# single object whose own oversized multivalued attribute makes the
+# response too large, with the object count nowhere near what
+# split_objects_by_budget() (above) would ever trim. This is [MS-ADDM]
+# 2.7.2.2's WS-Enumeration range retrieval extension, applied per
+# object in _build_objects() -- the ad:SelectionProperty counterpart to
+# render_transfer_get()'s da:AttributeType one, tested there in detail.
+# These tests cover only the Pull-specific wiring: that it engages at
+# all, and that it composes with object-count budgeting rather than
+# conflicting with it.
+
+def _count_values_measurer(xml):
+    return xml.count('<ad:value')
+
+
+def test_single_object_with_oversized_attribute_is_shrunk(
+        sambautils, recording, monkeypatch):
+    """
+    The confirmed live scenario: one object matched, requesting an
+    attribute large enough on its own to exceed budget. Object-count
+    budgeting cannot help here (there is only one object); the
+    per-object attribute shrink from render_transfer_get() applies to
+    Pull results too.
+    """
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 2)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 1)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [('CN=group1,' + DOMAIN_DN, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(5)],
+            'objectClass': [b'top', b'group'],
+        })],
+        base=DOMAIN_DN, scope=ldb.SCOPE_SUBTREE,
+        expression='(objectClass=group)',
+        attrs=['member', 'objectClass',
+               'userAccountControl', 'primaryGroupID'],
+    )
+
+    context = base_context(
+        SelectionProperty_List=['addata:member'],
+        measure_wcf_size=_count_values_measurer)
+    context['LdapQuery']['Filter'] = '(objectClass=group)'
+    root = parse(render(sambautils, rec, context))
+
+    group_elem = list(items(root))[0]
+    member_elem = group_elem.find('addata:member', NSMAP)
+    assert member_elem.get('RangeLow') == '0'
+    assert member_elem.get('RangeHigh') == '1', (
+        'budget of 2 values should keep the largest fitting prefix, '
+        '2 of the 5 member values, not all 5 nor just 1'
+    )
+
+
+def test_client_requested_selection_property_range_is_honoured(
+        sambautils, recording):
+    """The ad:SelectionProperty counterpart to da:AttributeType ranges."""
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [('CN=group1,' + DOMAIN_DN, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(10)],
+            'objectClass': [b'top', b'group'],
+        })],
+        base=DOMAIN_DN, scope=ldb.SCOPE_SUBTREE,
+        expression='(objectClass=group)',
+        attrs=['member', 'objectClass',
+               'userAccountControl', 'primaryGroupID'],
+    )
+
+    context = base_context(
+        SelectionProperty_List=['addata:member'],
+        SelectionPropertyRanges={'member': ('2', '3')})
+    context['LdapQuery']['Filter'] = '(objectClass=group)'
+    root = parse(render(sambautils, rec, context))
+
+    member_elem = list(items(root))[0].find('addata:member', NSMAP)
+    assert member_elem.get('RangeLow') == '2'
+    assert member_elem.get('RangeHigh') == '3'
+    values = [v.text for v in member_elem.findall('ad:value', NSMAP)]
+    assert values == ['CN=user2,%s' % DOMAIN_DN, 'CN=user3,%s' % DOMAIN_DN]
+
+
+def test_per_object_shrink_composes_with_object_count_budget(
+        sambautils, recording, monkeypatch):
+    """
+    Two objects, each individually safe once its own oversized
+    attribute is shrunk, still go through split_objects_by_budget()
+    afterwards -- per-object attribute shrinking does not bypass or
+    conflict with the existing object-count mechanism.
+    """
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_BUDGET_BYTES', 3)
+    monkeypatch.setattr(sambautils, 'WCF_RESPONSE_SIZE_CHECK_EVERY', 1)
+
+    rec = recording().add_syntax(SYNTAXES)
+    rec.add_search(
+        [('CN=group1,' + DOMAIN_DN, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(5)],
+            'objectClass': [b'top', b'group'],
+        }), ('CN=group2,' + DOMAIN_DN, {
+            'member': [('CN=user%d,%s' % (i, DOMAIN_DN)).encode()
+                       for i in range(5)],
+            'objectClass': [b'top', b'group'],
+        })],
+        base=DOMAIN_DN, scope=ldb.SCOPE_SUBTREE,
+        expression='(objectClass=group)',
+        attrs=['member', 'objectClass',
+               'userAccountControl', 'primaryGroupID'],
+    )
+
+    context = base_context(
+        SelectionProperty_List=['addata:member'],
+        measure_wcf_size=_count_values_measurer)
+    context['LdapQuery']['Filter'] = '(objectClass=group)'
+    root = parse(render(sambautils, rec, context))
+
+    # Each object's own member list is shrunk to fit under the full
+    # budget alone (this is what _build_objects() guarantees), and
+    # split_objects_by_budget() then fits as many whole objects as
+    # the same budget allows across the actual page.
+    rendered_groups = list(items(root))
+    assert len(rendered_groups) >= 1
+    for group_elem in rendered_groups:
+        member_elem = group_elem.find('addata:member', NSMAP)
+        assert len(member_elem.findall('ad:value', NSMAP)) <= 3

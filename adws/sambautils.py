@@ -6,7 +6,7 @@ Original Link:    https://gitlab.com/catalyst-samba/samba-adws
 Updated by:       Neal Russell
 Script Created:   2024-Jan-01
 Script Modified:  2026-Sep-06
-Script Version:   1.2.1
+Script Version:   1.3.0
 Script Purpose:   Core AD backend for the samba-adws ADWS proxy. Provides
                   attribute models, Jinja2 template rendering, and the
                   SamDBHelper class which connects to the local Samba LDB
@@ -216,17 +216,26 @@ Change Log:
            attributes) down to about 1.5 seconds and no longer
            leaving usable budget on the table by stopping at the
            first size that happened to fit.
+  1.3.0  - render_pull()'s per-object rendering, in _build_objects(),
+           now applies the same attribute value range retrieval
+           render_transfer_get() has, via [MS-ADDM] 2.7.2.2's
+           WS-Enumeration extension (ad:SelectionProperty RangeLow/
+           RangeHigh, the counterpart to WS-Transfer's da:AttributeType
+           one). Confirmed live, 2026-09-06: an Enumerate/Pull search
+           can match a single object whose own oversized attribute
+           makes the response too large, independent of object count,
+           which split_objects_by_budget() alone cannot address.
+           split_attr_values_by_budget() now takes a render_candidate
+           callback rather than a hardcoded template, so render_pull()
+           can measure a single-object trial Pull.xml while
+           render_transfer_get() keeps measuring the whole
+           GetResponse, sharing one binary search implementation
+           between both.
 ------------------------------------------------------------------------------
 To Do List:
   *  Implement WS-Transfer Put (Set-AD* cmdlets).
   *  Implement WS-Transfer Create / Delete (New-AD* / Remove-AD*).
   *  Implement MS-ADCAP custom operations (password change, unlock, etc.).
-  *  Implement [MS-ADDM] 2.7's WS-Enumeration range retrieval
-       extension (as opposed to the WS-Transfer one render_transfer_get()
-       now has) so a large multivalued attribute requested via
-       ad:SelectionProperty in an Enumerate/Pull, such as a large
-       group's member list returned from a directory search rather
-       than a direct Get by GUID, can also be range-limited.
 ------------------------------------------------------------------------------
 """
 from __future__ import print_function, absolute_import
@@ -816,14 +825,26 @@ def split_objects_by_budget(objects, context):
 
 
 
-def split_attr_values_by_budget(attrs, context):
+def split_attr_values_by_budget(attrs, context, render_candidate):
     """
-    Shrink whichever of a WS-Transfer Get response's attrs are not
-    already range-limited by the client's own request, until the
-    candidate transfer-Get.xml response fits under
+    Shrink whichever of a set of attrs are not already range-limited
+    by the client's own request, until a candidate response fits under
     WCF_RESPONSE_SIZE_BUDGET_BYTES, applying LdapAttr.apply_range() to
     each one shrunk so RangeLow/RangeHigh tell the client how to
     request the remainder ([MS-ADDM] 2.7).
+
+    render_candidate(attrs) -> xml_string renders whatever the caller
+    actually needs measured. render_transfer_get() renders the whole
+    WS-Transfer GetResponse with these attrs on the one object being
+    fetched. render_pull()'s per-object shrinking renders a
+    single-object trial Pull.xml (see _build_objects()), since a
+    Pull page's real oversized-attribute problem is "does this ONE
+    object's own attributes fit", independent of how many other
+    objects end up sharing the page -- that is what
+    split_objects_by_budget() decides separately, afterwards. Sharing
+    this one function between both call sites, rather than
+    duplicating the search below, is why the candidate rendering is a
+    callback instead of a hardcoded template name.
 
     context['measure_wcf_size'] behaves exactly as in
     split_objects_by_budget(); its absence means every value is kept,
@@ -884,10 +905,7 @@ def split_attr_values_by_budget(attrs, context):
         return attrs
 
     def candidate_size():
-        trial_context = dict(context)
-        trial_context['attrs'] = attrs
-        trial_xml = render_template('transfer-Get.xml', **trial_context)
-        return measure(trial_xml)
+        return measure(render_candidate(attrs))
 
     if candidate_size() <= WCF_RESPONSE_SIZE_BUDGET_BYTES:
         return attrs
@@ -1246,7 +1264,13 @@ class SamDBHelper(SamDB):
                     else int(range_high.strip()),
                 )
 
-        attrs = split_attr_values_by_budget(attrs, context)
+        def render_get_candidate(candidate_attrs):
+            trial_context = dict(context)
+            trial_context['attrs'] = candidate_attrs
+            return render_template('transfer-Get.xml', **trial_context)
+
+        attrs = split_attr_values_by_budget(
+            attrs, context, render_get_candidate)
 
         context['attrs'] = attrs
         return render_template('transfer-Get.xml', **context)
@@ -1423,7 +1447,7 @@ class SamDBHelper(SamDB):
 
             msgs_to_render = list(result.msgs)
             new_objects    = self._build_objects(
-                msgs_to_render, attr_names, fetch_all)
+                msgs_to_render, attr_names, fetch_all, context)
 
         else:
             # Empty BaseObject means 'search the entire directory'.
@@ -1452,7 +1476,7 @@ class SamDBHelper(SamDB):
             # Multi-NC results are returned as a single complete page.
             ldb_exhausted = True
             new_objects   = self._build_objects(
-                msgs_to_render, attr_names, fetch_all)
+                msgs_to_render, attr_names, fetch_all, context)
 
         enumeration_context['ldb_exhausted'] = ldb_exhausted
 
@@ -1466,7 +1490,7 @@ class SamDBHelper(SamDB):
 
 
 
-    def _build_objects(self, msgs_to_render, attr_names, fetch_all):
+    def _build_objects(self, msgs_to_render, attr_names, fetch_all, context):
         """
         Convert LDB result messages into (object_class, attrs) tuples
         ready for Pull.xml, exactly as render_pull() always has.
@@ -1475,7 +1499,32 @@ class SamDBHelper(SamDB):
         most-derived. The last value is what we want: e.g. for a user
         the list is ['top', 'person', 'organizationalPerson', 'user']
         and we use 'user' as the XML element name.
+
+        Attribute value range retrieval
+        --------------------------------
+        Confirmed live, 2026-09-06: an Enumerate/Pull search can match
+        a single object (or a few) whose own oversized multivalued
+        attributes make the response too large on their own, with
+        object count nowhere near what would trigger
+        split_objects_by_budget(). This is [MS-ADDM] 2.7.2.2's
+        WS-Enumeration range retrieval extension, the ad:SelectionProperty
+        counterpart to render_transfer_get()'s da:AttributeType one,
+        applied per object here rather than once per response: a
+        client's explicit range (context['SelectionPropertyRanges'],
+        parsed once at Enumerate time and persisted on
+        enumeration_context so every later Pull on the same
+        EnumerationContext still has it) is applied first, and
+        split_attr_values_by_budget() then shrinks whatever the client
+        did not bound itself, measuring a single-object trial Pull.xml
+        rather than the real, possibly multi-object, final page --
+        this object's own attributes either fit under the full budget
+        alone or they do not, independent of how many neighbours end
+        up sharing the actual page. split_objects_by_budget() applies
+        afterwards, across these now individually safe objects, exactly
+        as before this existed.
         """
+        selection_ranges = context.get('SelectionPropertyRanges', {})
+
         objects = []
         for msg in msgs_to_render:
             object_class = (
@@ -1509,6 +1558,25 @@ class SamDBHelper(SamDB):
                 msg,
                 attr_names=effective_attr_names
             )
+
+            for attr in attrs:
+                if attr.attr in selection_ranges:
+                    range_low, range_high = selection_ranges[attr.attr]
+                    attr.apply_range(
+                        int(range_low.strip()),
+                        None if range_high in (None, '*')
+                        else int(range_high.strip()),
+                    )
+
+            def render_pull_object_candidate(candidate_attrs,
+                                              object_class=object_class):
+                trial_context = dict(context)
+                trial_context['objects'] = [(object_class, candidate_attrs)]
+                trial_context['is_end'] = False
+                return render_template('Pull.xml', **trial_context)
+
+            attrs = split_attr_values_by_budget(
+                attrs, context, render_pull_object_candidate)
 
             objects.append((object_class, attrs))
         return objects
